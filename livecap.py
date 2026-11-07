@@ -140,9 +140,9 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
     """Translate finalized [them] segments off the caption critical path."""
     from deep_translator import GoogleTranslator, MyMemoryTranslator
     try:
-        tr = MyMemoryTranslator(source="en-US", target=lang,
-                                email=email)
-        fallback = GoogleTranslator(source="en", target=lang.split("-")[0])
+        tr = GoogleTranslator(source="en", target=lang.split("-")[0])
+        fallback = MyMemoryTranslator(source="en-US", target=lang,
+                                      email=email)
     except Exception as e:
         gui_q.put(("trans", f"[translation unavailable: {e}]"))
         return
