@@ -260,8 +260,15 @@ def run_live(device, pipe: Pipeline, mode: str):
             ctypes.windll.ole32.CoInitialize(None)
             com_init = True
             warnings.filterwarnings("ignore", "data discontinuity")
-            mic = sc.get_microphone(sc.default_speaker().name,
-                                    include_loopback=True)
+            # a real mic can share the speaker's name (e.g. "Remote Audio"
+            # on RDP) — get_microphone() then resolves to the mic, not the
+            # loopback; match the speaker's endpoint id instead
+            speaker = sc.default_speaker()
+            mic = next((m for m in sc.all_microphones(include_loopback=True)
+                        if m.isloopback and m.id == speaker.id), None)
+            if mic is None:
+                raise RuntimeError(
+                    f"no loopback capture device for {speaker.name!r}")
             with mic.recorder(samplerate=SR, channels=1) as rec:
                 while True:
                     put(("spk", rec.record(shift)[:, 0]))
