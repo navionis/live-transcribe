@@ -362,7 +362,8 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
 # ------------------------------------------------------------------ overlay
 
 BG, DIM, TXT, MUTE, ACC = "#101418", "#9ca3af", "#f9fafb", "#4b5563", "#93c5fd"
-CFG = Path(__file__).resolve().parent / "livecap-window.json"
+LOGS = ROOT / "logs"
+CFG = LOGS / "livecap-window.json"
 
 
 class Overlay:
@@ -599,7 +600,8 @@ def main():
     gui_q = queue.Queue()
     mute, den_off = threading.Event(), threading.Event()
     log_lock = threading.Lock()
-    log = open(ROOT / f"livecap-{time.strftime('%Y%m%d-%H%M%S')}.txt",
+    LOGS.mkdir(exist_ok=True)
+    log = open(LOGS / f"livecap-{time.strftime('%Y%m%d-%H%M%S')}.txt",
                "w", encoding="utf-8", buffering=1)
     trans_q = queue.Queue(maxsize=4) if args.lang else None
 
