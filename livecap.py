@@ -9,11 +9,14 @@ Needs VB-CABLE installed and selected as the mic in your call app for the
 passthrough half; captions work either way. Esc or close the window to quit.
 """
 
+import json
 import queue
 import signal
 import sys
 import threading
+import time
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -188,15 +191,26 @@ def find_cable():
     return None, None
 
 
-def voice_engine(mic_q, den, ring, cable_sr, micasr_q):
+def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue."""
+    needs_reset = False
     while not stop.is_set():
         try:
             x = mic_q.get(timeout=0.1)
         except queue.Empty:
             continue
-        out = den.run(np.ascontiguousarray(x, np.float32), SR)
-        y = np.asarray(out.samples, dtype=np.float32)
+        if mute.is_set():                    # hard mute: nothing leaves
+            needs_reset = True
+            continue
+        if den_off.is_set():                 # passthrough without denoise
+            y = np.ascontiguousarray(x, np.float32)
+            needs_reset = True
+        else:
+            if needs_reset:                  # resync denoiser frame state
+                den.reset()
+                needs_reset = False
+            out = den.run(np.ascontiguousarray(x, np.float32), SR)
+            y = np.asarray(out.samples, dtype=np.float32)
         if not len(y):
             continue
         if ring is not None:
@@ -235,7 +249,7 @@ def loopback_pump(qs):
 
 # ------------------------------------------------------------- asr consumer
 
-def asr_consumer(pipe, qs, qm, gui_q):
+def asr_consumer(pipe, qs, qm, gui_q, log):
     def get():
         for tag, q in (("spk", qs), ("mic", qm)):   # speaker first, always
             try:
@@ -263,6 +277,8 @@ def asr_consumer(pipe, qs, qm, gui_q):
             continue
         final = pipe.feed(chunk, tag)
         if final:
+            log.write(f"[{time.strftime('%H:%M:%S')}] "
+                      f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
             gui_q.put(("final", tag, final))
         elif pipe.partials.get(tag):
             p = pipe.partials[tag]
@@ -276,45 +292,83 @@ def asr_consumer(pipe, qs, qm, gui_q):
 
 # ------------------------------------------------------------------ overlay
 
-BG, DIM, TXT, MUTE = "#101418", "#9ca3af", "#f9fafb", "#4b5563"
+BG, DIM, TXT, MUTE, ACC = "#101418", "#9ca3af", "#f9fafb", "#4b5563", "#93c5fd"
+CFG = Path(__file__).resolve().parent / "livecap-window.json"
 
 
 class Overlay:
-    def __init__(self, gui_q):
+    def __init__(self, gui_q, status, mute, den_off):
         self.q = gui_q
+        self.mute, self.den_off = mute, den_off
         self.them = {"last": "", "now": ""}
         self.me = ""
+        self.finals = deque(maxlen=50)
+        self.fs, self.alpha = 11, 0.85
         r = self.root = tk.Tk()
         r.overrideredirect(True)
-        r.attributes("-topmost", True, "-alpha", 0.85)
+        r.attributes("-topmost", True, "-alpha", self.alpha)
         r.configure(bg=BG)
-        w, h = 920, 100
-        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
-        r.geometry(f"{w}x{h}+{(sw - w) // 2}+{sh - h - 90}")
+        geo = self._load_geo()
+        w, h = geo.get("w", 920), geo.get("h", 100)
+        x = geo.get("x", (r.winfo_screenwidth() - w) // 2)
+        y = geo.get("y", r.winfo_screenheight() - h - 90)
+        r.geometry(f"{w}x{h}+{x}+{y}")
         mk = lambda **kw: tk.Label(r, bg=BG, anchor="w", justify="left",
                                    wraplength=w - 24, **kw)
+
+        top = tk.Frame(r, bg=BG)
+        top.pack(fill="x")
+        self.status = tk.Label(top, text=status, fg=ACC, bg=BG,
+                               anchor="w", font=("Segoe UI", 9))
+        self.status.pack(side="left", padx=12)
+        self.mute_lbl = self._ctl(top, "mic: on", self.tgl_mute)
+        self.den_lbl = self._ctl(top, "denoise: on", self.tgl_den)
+        self._ctl(top, "copy all", self.copy_all)
+        self._ctl(top, "copy", self.copy_last)
+        self._ctl(top, "×", self.close)
+
         self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
         self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
-        for lbl in (self.them_last, self.them_now, self.me_now):
+        self.text_lbls = (self.them_last, self.them_now, self.me_now)
+        for lbl in self.text_lbls:
             lbl.pack(fill="x", padx=12)
-        mk(fg=MUTE, font=("Segoe UI", 8),
-           text="drag to move · esc to quit").pack(anchor="se", padx=8)
-        for wdg in (r, *r.winfo_children()):
+        grip = mk(fg=MUTE, font=("Segoe UI", 8), text="◢",
+                  cursor="size_nw_se")
+        grip.pack(anchor="se", padx=4)
+        grip.bind("<Button-1>", self._rs_down)
+        grip.bind("<B1-Motion>", self._rs_move)
+
+        for wdg in (r, top, self.status, *self.text_lbls):
             wdg.bind("<Button-1>", self._down)
             wdg.bind("<B1-Motion>", self._move)
         r.bind("<Escape>", lambda e: self.close())
+        r.bind("m", lambda e: self.tgl_mute())
+        r.bind("d", lambda e: self.tgl_den())
+        r.bind("c", lambda e: self.copy_last())
+        r.bind("<MouseWheel>", self._wheel)
         signal.signal(signal.SIGINT, self._sigint)
         r.update_idletasks()
-        # WDA_EXCLUDEFROMCAPTURE: visible on screen, invisible to
+        # WDA_EXCLUDEFROMCAPTURE: on screen normally, invisible to
         # screenshots and screen-share capture (Windows 10 1903+)
+        hidden = False
         try:
             import ctypes
-            ctypes.windll.user32.SetWindowDisplayAffinity(
-                int(r.wm_frame(), 16), 0x11)
+            hidden = bool(ctypes.windll.user32.SetWindowDisplayAffinity(
+                int(r.wm_frame(), 16), 0x11))
         except Exception:
             pass
+        if hidden:
+            self.status.config(text=status + " · hidden-from-capture ✓")
         r.after(30, self._poll)
+        r.after(9000, lambda: self.status.config(text=""))
+
+    def _ctl(self, parent, text, fn):
+        lbl = tk.Label(parent, text=text, fg=DIM, bg=BG,
+                       font=("Segoe UI", 9), cursor="hand2")
+        lbl.pack(side="right", padx=5, pady=2)
+        lbl.bind("<Button-1>", lambda e: fn())
+        return lbl
 
     def _sigint(self, *_):
         # Tcl's event wait swallows Ctrl+C; after() wakes the loop
@@ -330,6 +384,54 @@ class Overlay:
     def _move(self, e):
         self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
+    def _rs_down(self, e):
+        self._rx, self._ry = e.x_root, e.y_root
+        self._rw, self._rh = self.root.winfo_width(), self.root.winfo_height()
+
+    def _rs_move(self, e):
+        w = max(360, self._rw + e.x_root - self._rx)
+        h = max(60, self._rh + e.y_root - self._ry)
+        self.root.geometry(f"{w}x{h}")
+        for lbl in self.text_lbls:
+            lbl.config(wraplength=w - 24)
+
+    def _wheel(self, e):
+        if e.state & 0x4:                        # ctrl+wheel: font size
+            self.fs = max(8, min(20, self.fs + (1 if e.delta > 0 else -1)))
+            self.them_last.config(font=("Segoe UI", self.fs - 1))
+            self.them_now.config(font=("Segoe UI", self.fs))
+            self.me_now.config(font=("Segoe UI", self.fs - 1))
+        else:                                    # wheel: opacity
+            self.alpha = max(0.35, min(1.0,
+                                       self.alpha + (0.05 if e.delta > 0
+                                                     else -0.05)))
+            self.root.attributes("-alpha", self.alpha)
+
+    def tgl_mute(self):
+        on = self.mute.is_set()                  # muted now? -> unmute
+        (self.mute.clear if on else self.mute.set)()
+        self.mute_lbl.config(text="mic: on" if on else "mic: muted")
+
+    def tgl_den(self):
+        on = self.den_off.is_set()               # denoise off? -> on
+        (self.den_off.clear if on else self.den_off.set)()
+        self.den_lbl.config(text="denoise: on" if on else "denoise: off")
+
+    def copy_last(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.them["now"] or self.them["last"])
+
+    def copy_all(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(self.finals))
+
+    def _load_geo(self):
+        try:
+            g = json.loads(CFG.read_text())
+            return g if isinstance(g, dict) else {}
+        except Exception:
+            return {}
+
     def _poll(self):
         dirty = False
         try:
@@ -344,6 +446,8 @@ class Overlay:
                         self.me = "you: " + text
                 elif ev[0] == "final":
                     _, tag, text = ev
+                    self.finals.append(
+                        ("them" if tag == "spk" else "you") + ": " + text)
                     if tag == "spk":
                         self.them["last"], self.them["now"] = text, ""
                     else:
@@ -357,10 +461,23 @@ class Overlay:
             self.them_last.config(text=self.them["last"] or zwsp)
             self.them_now.config(text=self.them["now"] or zwsp)
             self.me_now.config(text=self.me or zwsp)
+            # grow the window to fit wrapped text (never auto-shrinks)
+            self.root.update_idletasks()
+            rh = self.root.winfo_reqheight()
+            if rh > self.root.winfo_height() + 2:
+                self.root.geometry(f"{self.root.winfo_width()}x{rh}"
+                                   f"+{self.root.winfo_x()}"
+                                   f"+{self.root.winfo_y()}")
         if not stop.is_set():
             self.root.after(30, self._poll)
 
     def close(self):
+        try:
+            CFG.write_text(json.dumps({
+                "x": self.root.winfo_x(), "y": self.root.winfo_y(),
+                "w": self.root.winfo_width(), "h": self.root.winfo_height()}))
+        except Exception:
+            pass
         stop.set()
         self.root.destroy()
 
@@ -378,12 +495,16 @@ def main():
     punct = None if "nemotron" in model_dir.name.lower() else make_punctuator()
     pipe = Pipeline(rec, punct)
 
+    status = []
     cable_idx, cable_sr = find_cable()
     ring = out_stream = None
     if cable_idx is None:
+        status.append("no VB-CABLE — install it, then pick 'CABLE "
+                      "Output' as your mic in the call app")
         print("VB-CABLE not found — captions only, no mic passthrough",
               file=sys.stderr)
     else:
+        status.append("cable ✓")
         ring = Ring(cable_sr // 2)  # 0.5s buffer
         out_stream = sd.OutputStream(
             device=cable_idx, samplerate=cable_sr, channels=1,
@@ -395,6 +516,9 @@ def main():
     micasr_q = queue.Queue(maxsize=512)   # post-denoise, lowest priority
     qs = queue.Queue(maxsize=512)         # speaker, highest priority
     gui_q = queue.Queue()
+    mute, den_off = threading.Event(), threading.Event()
+    log = open(ROOT / f"livecap-{time.strftime('%Y%m%d-%H%M%S')}.txt",
+               "w", encoding="utf-8", buffering=1)
 
     in_stream = None
     try:
@@ -403,22 +527,27 @@ def main():
             blocksize=den.frame_shift_in_samples,
             callback=lambda d, f, t, s: put_drop(mic_q, d[:, 0].copy()))
         in_stream.start()
+        status.append("mic ✓")
     except Exception as e:
-        print(f"no mic input ({e}) — speaker captions only", file=sys.stderr)
+        status.append("no mic — speaker captions only")
+        print(f"no mic input ({e})", file=sys.stderr)
     if out_stream is not None:
         out_stream.start()
     threading.Thread(target=voice_engine, daemon=True,
-                     args=(mic_q, den, ring, cable_sr, micasr_q)).start()
+                     args=(mic_q, den, ring, cable_sr, micasr_q,
+                           mute, den_off)).start()
     threading.Thread(target=loopback_pump, daemon=True, args=(qs,)).start()
     threading.Thread(target=asr_consumer, daemon=True,
-                     args=(pipe, qs, micasr_q, gui_q)).start()
+                     args=(pipe, qs, micasr_q, gui_q, log)).start()
 
+    status.append(model_dir.name[:30])
     print("livecap running — mic -> denoise -> cable, captions for both",
           file=sys.stderr)
     try:
-        Overlay(gui_q).run()
+        Overlay(gui_q, " · ".join(status), mute, den_off).run()
     finally:
         stop.set()
+        log.close()
         if out_stream is not None:
             out_stream.stop()
             out_stream.close()
