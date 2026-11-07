@@ -137,12 +137,14 @@ def lang_code(code: str) -> str:
 
 def translator_worker(tq, gui_q, log, log_lock, lang):
     """Translate finalized [them] segments off the caption critical path."""
-    from deep_translator import MyMemoryTranslator
+    from deep_translator import GoogleTranslator, MyMemoryTranslator
     try:
         tr = MyMemoryTranslator(source="en-US", target=lang)
+        fallback = GoogleTranslator(source="en", target=lang.split("-")[0])
     except Exception as e:
         gui_q.put(("trans", f"[translation unavailable: {e}]"))
         return
+    warned = False
     while not stop.is_set():
         try:
             text = tq.get(timeout=0.1)
@@ -155,11 +157,19 @@ def translator_worker(tq, gui_q, log, log_lock, lang):
                 break
         try:
             out = tr.translate(text)
+        except Exception:
+            try:
+                out = fallback.translate(text)
+            except Exception:
+                out = None
+        if out:
+            warned = False
             gui_q.put(("trans", out))
             with log_lock:
                 log.write(f"    -> {out}\n")
-        except Exception:
-            pass                           # transient network errors
+        elif not warned:                   # visible once, not per call
+            warned = True
+            gui_q.put(("trans", "[translation paused — rate limit]"))
 
 
 # ------------------------------------------------------------------- asr
@@ -554,9 +564,9 @@ class Overlay:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--lang", metavar="CODE",
+    ap.add_argument("--lang", metavar="CODE", default="ja",
                     help="translate [them] captions to this language "
-                         "(e.g. ko, ja, vi, zh-CN)")
+                         "(e.g. ko, ja, vi, zh-CN; default: ja)")
     args = ap.parse_args()
 
     den = make_denoiser()

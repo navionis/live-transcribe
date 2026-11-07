@@ -54,6 +54,11 @@ main thread            tkinter Overlay, after(30ms) drains gui_q
 - overlay: frameless always-on-top tkinter, draggable, Esc or Ctrl+C
   to quit; `SetWindowDisplayAffinity(hwnd, 0x11)` hides it from
   screenshots/screen-share (Krisp behavior)
+- `--lang CODE` (default `ja`): finalized `[them]` segments translated
+  by a worker thread (drain-to-latest) via deep-translator MyMemory,
+  falling back to GoogleTranslator; shows on a small accent line under
+  `[them]`; `[translation paused - rate limit]` shown on quota errors;
+  translations appended to transcript log
 - graceful degradation: no VB-CABLE -> captions only; no mic ->
   speaker captions only; loopback error -> shown on `[them]` line
 
