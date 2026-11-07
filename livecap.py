@@ -11,6 +11,7 @@ passthrough half; captions work either way. Esc or close the window to quit.
 
 import argparse
 import json
+import os
 import queue
 import signal
 import sys
@@ -135,11 +136,12 @@ def lang_code(code: str) -> str:
     return code if "-" in code else f"{code}-{code.upper()}"
 
 
-def translator_worker(tq, gui_q, log, log_lock, lang):
+def translator_worker(tq, gui_q, log, log_lock, lang, email):
     """Translate finalized [them] segments off the caption critical path."""
     from deep_translator import GoogleTranslator, MyMemoryTranslator
     try:
-        tr = MyMemoryTranslator(source="en-US", target=lang)
+        tr = MyMemoryTranslator(source="en-US", target=lang,
+                                email=email)
         fallback = GoogleTranslator(source="en", target=lang.split("-")[0])
     except Exception as e:
         gui_q.put(("trans", f"[translation unavailable: {e}]"))
@@ -568,6 +570,10 @@ def main():
     ap.add_argument("--lang", metavar="CODE", default="ja",
                     help="translate [them] captions to this language "
                          "(e.g. ko, ja, vi, zh-CN; default: ja)")
+    ap.add_argument("--trans-email", metavar="EMAIL",
+                    default=os.environ.get("LIVECAP_TRANS_EMAIL"),
+                    help="email for MyMemory — raises free quota ~10x "
+                         "(or set LIVECAP_TRANS_EMAIL)")
     args = ap.parse_args()
 
     den = make_denoiser()
@@ -629,7 +635,8 @@ def main():
         status.append(f"trans→{args.lang}")
         threading.Thread(target=translator_worker, daemon=True,
                          args=(trans_q, gui_q, log, log_lock,
-                               lang_code(args.lang))).start()
+                               lang_code(args.lang),
+                               args.trans_email)).start()
 
     status.append(model_dir.name[:30])
     print("livecap running — mic -> denoise -> cable, captions for both",
