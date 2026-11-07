@@ -265,7 +265,12 @@ def asr_consumer(pipe, qs, qm, gui_q):
         if final:
             gui_q.put(("final", tag, final))
         elif pipe.partials.get(tag):
-            gui_q.put(("partial", tag, pipe.partials[tag]))
+            p = pipe.partials[tag]
+            # raw zipformer partials are ALL-CAPS — sentence-case them for
+            # display (leave already-cased models like nemotron alone)
+            if p.isupper():
+                p = p.capitalize()
+            gui_q.put(("partial", tag, p))
     pipe.flush()
 
 
@@ -289,7 +294,7 @@ class Overlay:
         mk = lambda **kw: tk.Label(r, bg=BG, anchor="w", justify="left",
                                    wraplength=w - 24, **kw)
         self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
-        self.them_now = mk(fg=TXT, font=("Segoe UI", 12, "bold"))
+        self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
         for lbl in (self.them_last, self.them_now, self.me_now):
             lbl.pack(fill="x", padx=12)
