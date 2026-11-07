@@ -10,6 +10,7 @@ passthrough half; captions work either way. Esc or close the window to quit.
 """
 
 import queue
+import signal
 import sys
 import threading
 import tkinter as tk
@@ -126,7 +127,8 @@ class Pipeline:
             self.rec.reset(stream)
             self.partials.pop(tag, None)
             if text:
-                return self.punct.add_punctuation_with_case(text.lower())
+                return (self.punct.add_punctuation_with_case(text.lower())
+                        if self.punct else text)
         else:
             self.partials[tag] = result_text(
                 self.rec.get_result(stream)).strip()
@@ -154,6 +156,9 @@ class Ring:
 
     def push(self, x: np.ndarray):
         n = len(x)
+        if n > self.n:                    # keep only the newest samples
+            x = x[n - self.n:]
+            n = self.n
         with self.lock:
             if n > self.n - (self.w - self.r):   # overflow: drop oldest
                 self.r += n - (self.n - (self.w - self.r))
@@ -278,14 +283,14 @@ class Overlay:
         r.overrideredirect(True)
         r.attributes("-topmost", True, "-alpha", 0.85)
         r.configure(bg=BG)
-        w, h = 920, 120
+        w, h = 920, 100
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
         r.geometry(f"{w}x{h}+{(sw - w) // 2}+{sh - h - 90}")
         mk = lambda **kw: tk.Label(r, bg=BG, anchor="w", justify="left",
                                    wraplength=w - 24, **kw)
-        self.them_last = mk(fg=MUTE, font=("Segoe UI", 11))
-        self.them_now = mk(fg=TXT, font=("Segoe UI", 15, "bold"))
-        self.me_now = mk(fg=DIM, font=("Segoe UI", 11))
+        self.them_last = mk(fg=MUTE, font=("Segoe UI", 10))
+        self.them_now = mk(fg=TXT, font=("Segoe UI", 12, "bold"))
+        self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
         for lbl in (self.them_last, self.them_now, self.me_now):
             lbl.pack(fill="x", padx=12)
         mk(fg=MUTE, font=("Segoe UI", 8),
@@ -294,7 +299,24 @@ class Overlay:
             wdg.bind("<Button-1>", self._down)
             wdg.bind("<B1-Motion>", self._move)
         r.bind("<Escape>", lambda e: self.close())
+        signal.signal(signal.SIGINT, self._sigint)
+        r.update_idletasks()
+        # WDA_EXCLUDEFROMCAPTURE: visible on screen, invisible to
+        # screenshots and screen-share capture (Windows 10 1903+)
+        try:
+            import ctypes
+            ctypes.windll.user32.SetWindowDisplayAffinity(
+                int(r.wm_frame(), 16), 0x11)
+        except Exception:
+            pass
         r.after(30, self._poll)
+
+    def _sigint(self, *_):
+        # Tcl's event wait swallows Ctrl+C; after() wakes the loop
+        try:
+            self.root.after(0, self.close)
+        except Exception:
+            pass
 
     def _down(self, e):
         self._dx, self._dy = e.x_root - self.root.winfo_x(), \
