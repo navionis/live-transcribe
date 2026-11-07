@@ -4,7 +4,8 @@ Real-time, CPU-only Krisp-style app for Windows:
 **mic → denoise → virtual mic for calls**, plus **live captions for both
 sides** (your voice and speaker output).
 
-- `[them]` — what others say (WASAPI speaker loopback → ASR)
+- `[them]` — what others say (WASAPI speaker loopback → ASR), with a
+  translated line underneath (`--lang`, default `ja`)
 - `you:` — what your call actually hears (mic → GTCRN denoise →
   VB-CABLE → tapped for captions)
 - Always-on-top overlay, draggable, invisible to screenshots/screen-share
@@ -14,7 +15,8 @@ sides** (your voice and speaker output).
 Python 3.11; venv is already set up in `.venv/`.
 
 ```
-.venv\Scripts\python.exe livecap.py
+.venv\Scripts\python.exe livecap.py           # translates [them] to ja by default
+.venv\Scripts\python.exe livecap.py --lang ko # pick another target language
 ```
 
 For the mic passthrough: install **VB-CABLE** and select "CABLE Output"
