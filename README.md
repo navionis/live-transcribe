@@ -18,7 +18,7 @@ not currently used anyway). The venv is already set up in `.venv/`.
 ## Usage
 
 ```
-python transcribe.py                     # mic -> gtcrn denoise -> asr -> punct
+python transcribe.py                     # mic -> asr -> punct (denoise off by default)
 python transcribe.py --denoiser dpdfnet  # better denoise, ~2x cpu
 python transcribe.py --denoiser none     # no denoise
 python transcribe.py --device 1          # pick input device (see below)

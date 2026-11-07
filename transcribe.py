@@ -6,7 +6,7 @@ CPU-only pipeline on Windows:
                -> online punctuation/case restoration -> stdout
 
 Usage:
-  python transcribe.py                      # mic -> gtcrn -> asr -> punct
+  python transcribe.py                      # mic -> asr -> punct
   python transcribe.py --denoiser dpdfnet   # heavier, better denoise
   python transcribe.py --denoiser none      # no denoise
   python transcribe.py --file some.wav      # process a wav file instead of mic
@@ -228,11 +228,14 @@ def run_file(path: str, pipe: Pipeline):
 def run_live(device, pipe: Pipeline, mode: str):
     """mode: 'mic' | 'spk' (speaker loopback) | 'both'."""
     shift = pipe.den.frame_shift_in_samples if pipe.den else 512
-    q = queue.Queue(maxsize=512)  # ~8s of 16ms chunks; drop oldest beyond that
+    # separate bounded queues: speaker audio is always drained before mic,
+    # so under a backlog the (lower-priority) dictation drops first
+    qs = queue.Queue(maxsize=512)
+    qm = queue.Queue(maxsize=512)
     stats = {"dropped": 0, "mic_overruns": 0}
     tagged = mode == "both"
 
-    def put(item):
+    def put(q, item):
         try:
             q.put_nowait(item)
         except queue.Full:
@@ -246,10 +249,26 @@ def run_live(device, pipe: Pipeline, mode: str):
                 pass
             stats["dropped"] += 1
 
+    def next_item():
+        for q in (qs, qm):          # spk queue first, then mic
+            try:
+                return q.get_nowait()
+            except queue.Empty:
+                pass
+        while True:                  # idle: block on spk, poll mic
+            try:
+                return qs.get(timeout=0.1)
+            except queue.Empty:
+                pass
+            try:
+                return qm.get_nowait()
+            except queue.Empty:
+                pass
+
     def cb(indata, frames, time_info, status):
         if status:
             stats["mic_overruns"] += 1
-        put(("mic", indata[:, 0].copy()))
+        put(qm, ("mic", indata[:, 0].copy()))
 
     def pump():
         import ctypes
@@ -271,9 +290,9 @@ def run_live(device, pipe: Pipeline, mode: str):
                     f"no loopback capture device for {speaker.name!r}")
             with mic.recorder(samplerate=SR, channels=1) as rec:
                 while True:
-                    put(("spk", rec.record(shift)[:, 0]))
+                    put(qs, ("spk", rec.record(shift)[:, 0]))
         except Exception as e:
-            put(("err", e))
+            put(qs, ("err", e))
         finally:
             if com_init:
                 ctypes.windll.ole32.CoUninitialize()
@@ -295,7 +314,7 @@ def run_live(device, pipe: Pipeline, mode: str):
         if stream is not None:
             stream.start()
         while True:
-            tag, chunk = q.get()
+            tag, chunk = next_item()
             if tag == "err":
                 sys.stdout.write(f"\x1b[2K\r[speaker capture failed: {chunk}]\n")
                 break
@@ -333,8 +352,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--denoiser", choices=["none", "gtcrn", "dpdfnet"],
                     default=None, help="denoiser for the captured source "
-                                       "(default: gtcrn; none for "
-                                       "speaker-only mode)")
+                                       "(default: none)")
     ap.add_argument("--device", type=int, default=None, help="input device index")
     ap.add_argument("--loopback", action="store_true",
                     help="capture speaker output (WASAPI loopback) instead of mic")
@@ -351,7 +369,7 @@ def main():
         os.system("")  # enable ANSI escapes on conhost
 
     mode = "both" if args.both else "spk" if args.loopback else "mic"
-    denoiser = args.denoiser or ("none" if mode == "spk" else "gtcrn")
+    denoiser = args.denoiser or "none"
 
     den = make_denoiser(denoiser)
     model_dir = asr_dir(args.model)
