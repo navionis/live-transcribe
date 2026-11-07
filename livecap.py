@@ -288,7 +288,7 @@ class Overlay:
         r.geometry(f"{w}x{h}+{(sw - w) // 2}+{sh - h - 90}")
         mk = lambda **kw: tk.Label(r, bg=BG, anchor="w", justify="left",
                                    wraplength=w - 24, **kw)
-        self.them_last = mk(fg=MUTE, font=("Segoe UI", 10))
+        self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
         self.them_now = mk(fg=TXT, font=("Segoe UI", 12, "bold"))
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
         for lbl in (self.them_last, self.them_now, self.me_now):
