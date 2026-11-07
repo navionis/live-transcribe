@@ -9,6 +9,7 @@ Needs VB-CABLE installed and selected as the mic in your call app for the
 passthrough half; captions work either way. Esc or close the window to quit.
 """
 
+import argparse
 import json
 import queue
 import signal
@@ -104,6 +105,61 @@ def put_drop(q: queue.Queue, item):
             q.put_nowait(item)
         except queue.Full:
             pass
+
+
+def lang_code(code: str) -> str:
+    """Normalize 'ko' -> 'ko-KR' style codes for the translator."""
+    code = code.strip().lower()
+    special = {
+        "zh": "zh-CN", "zh-tw": "zh-TW", "zh-hk": "zh-HK",
+        "en": "en-US", "pt": "pt-PT", "no": "nb-NO",
+        # lang != region for these common targets
+        "ko": "ko-KR", "ja": "ja-JP", "vi": "vi-VN", "fr": "fr-FR",
+        "de": "de-DE", "es": "es-ES", "it": "it-IT", "nl": "nl-NL",
+        "sv": "sv-SE", "da": "da-DK", "fi": "fi-FI", "pl": "pl-PL",
+        "ru": "ru-RU", "uk": "uk-UA", "cs": "cs-CZ", "sk": "sk-SK",
+        "hu": "hu-HU", "ro": "ro-RO", "bg": "bg-BG", "hr": "hr-HR",
+        "sl": "sl-SI", "lt": "lt-LT", "lv": "lv-LV", "et": "et-EE",
+        "el": "el-GR", "tr": "tr-TR", "ar": "ar-SA", "he": "he-IL",
+        "hi": "hi-IN", "bn": "bn-IN", "ta": "ta-IN", "te": "te-IN",
+        "ur": "ur-PK", "pa": "pa-IN", "gu": "gu-IN", "kn": "kn-IN",
+        "ml": "ml-IN", "mr": "mr-IN", "si": "si-LK", "th": "th-TH",
+        "my": "my-MM", "km": "km-KH", "lo": "lo-LA", "ms": "ms-MY",
+        "id": "id-ID", "tl": "tl-PH", "mn": "mn-MN", "kk": "kk-KZ",
+        "ka": "ka-GE", "hy": "hy-AM", "az": "az-AZ", "uz": "uz-UZ",
+        "sq": "sq-AL", "mk": "mk-MK", "sr": "sr-Latn-RS", "fa": "fa-IR",
+        "sw": "sw-KE", "af": "af-ZA", "am": "am-ET",
+    }
+    if code in special:
+        return special[code]
+    return code if "-" in code else f"{code}-{code.upper()}"
+
+
+def translator_worker(tq, gui_q, log, log_lock, lang):
+    """Translate finalized [them] segments off the caption critical path."""
+    from deep_translator import MyMemoryTranslator
+    try:
+        tr = MyMemoryTranslator(source="en-US", target=lang)
+    except Exception as e:
+        gui_q.put(("trans", f"[translation unavailable: {e}]"))
+        return
+    while not stop.is_set():
+        try:
+            text = tq.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        while True:                        # keep only the newest segment
+            try:
+                text = tq.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            out = tr.translate(text)
+            gui_q.put(("trans", out))
+            with log_lock:
+                log.write(f"    -> {out}\n")
+        except Exception:
+            pass                           # transient network errors
 
 
 # ------------------------------------------------------------------- asr
@@ -249,7 +305,7 @@ def loopback_pump(qs):
 
 # ------------------------------------------------------------- asr consumer
 
-def asr_consumer(pipe, qs, qm, gui_q, log):
+def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
     def get():
         for tag, q in (("spk", qs), ("mic", qm)):   # speaker first, always
             try:
@@ -277,8 +333,11 @@ def asr_consumer(pipe, qs, qm, gui_q, log):
             continue
         final = pipe.feed(chunk, tag)
         if final:
-            log.write(f"[{time.strftime('%H:%M:%S')}] "
-                      f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
+            with log_lock:
+                log.write(f"[{time.strftime('%H:%M:%S')}] "
+                          f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
+            if trans_q is not None and tag == "spk":
+                put_drop(trans_q, final)
             gui_q.put(("final", tag, final))
         elif pipe.partials.get(tag):
             p = pipe.partials[tag]
@@ -302,6 +361,7 @@ class Overlay:
         self.mute, self.den_off = mute, den_off
         self.them = {"last": "", "now": ""}
         self.me = ""
+        self.tr = ""
         self.finals = deque(maxlen=50)
         self.fs, self.alpha = 11, 0.85
         r = self.root = tk.Tk()
@@ -329,8 +389,10 @@ class Overlay:
 
         self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
         self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
+        self.trans = mk(fg=ACC, font=("Segoe UI", 10))
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
-        self.text_lbls = (self.them_last, self.them_now, self.me_now)
+        self.text_lbls = (self.them_last, self.them_now, self.trans,
+                          self.me_now)
         for lbl in self.text_lbls:
             lbl.pack(fill="x", padx=12)
         grip = mk(fg=MUTE, font=("Segoe UI", 8), text="◢",
@@ -452,6 +514,8 @@ class Overlay:
                         self.them["last"], self.them["now"] = text, ""
                     else:
                         self.me = "you: " + text
+                elif ev[0] == "trans":
+                    self.tr = ev[1]
                 elif ev[0] == "err":
                     self.them["now"] = ev[1]
         except queue.Empty:
@@ -460,6 +524,7 @@ class Overlay:
             zwsp = "\u200b"
             self.them_last.config(text=self.them["last"] or zwsp)
             self.them_now.config(text=self.them["now"] or zwsp)
+            self.trans.config(text=self.tr or zwsp)
             self.me_now.config(text=self.me or zwsp)
             # grow the window to fit wrapped text (never auto-shrinks)
             self.root.update_idletasks()
@@ -488,6 +553,12 @@ class Overlay:
 # --------------------------------------------------------------------- main
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lang", metavar="CODE",
+                    help="translate [them] captions to this language "
+                         "(e.g. ko, ja, vi, zh-CN)")
+    args = ap.parse_args()
+
     den = make_denoiser()
     model_dir = asr_dir()
     print(f"ASR model: {model_dir.name}", file=sys.stderr)
@@ -517,8 +588,10 @@ def main():
     qs = queue.Queue(maxsize=512)         # speaker, highest priority
     gui_q = queue.Queue()
     mute, den_off = threading.Event(), threading.Event()
+    log_lock = threading.Lock()
     log = open(ROOT / f"livecap-{time.strftime('%Y%m%d-%H%M%S')}.txt",
                "w", encoding="utf-8", buffering=1)
+    trans_q = queue.Queue(maxsize=4) if args.lang else None
 
     in_stream = None
     try:
@@ -538,7 +611,13 @@ def main():
                            mute, den_off)).start()
     threading.Thread(target=loopback_pump, daemon=True, args=(qs,)).start()
     threading.Thread(target=asr_consumer, daemon=True,
-                     args=(pipe, qs, micasr_q, gui_q, log)).start()
+                     args=(pipe, qs, micasr_q, gui_q, log, log_lock,
+                           trans_q)).start()
+    if trans_q is not None:
+        status.append(f"trans→{args.lang}")
+        threading.Thread(target=translator_worker, daemon=True,
+                         args=(trans_q, gui_q, log, log_lock,
+                               lang_code(args.lang))).start()
 
     status.append(model_dir.name[:30])
     print("livecap running — mic -> denoise -> cable, captions for both",
