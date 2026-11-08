@@ -382,7 +382,7 @@ class Overlay:
         r.attributes("-topmost", True, "-alpha", self.alpha)
         r.configure(bg=BG)
         geo = self._load_geo()
-        w, h = geo.get("w", 920), geo.get("h", 100)
+        w, h = geo.get("w", 560), geo.get("h", 100)
         x = geo.get("x", (r.winfo_screenwidth() - w) // 2)
         y = geo.get("y", r.winfo_screenheight() - h - 90)
         r.geometry(f"{w}x{h}+{x}+{y}")
@@ -401,10 +401,10 @@ class Overlay:
         self._ctl(top, "×", self.close)
 
         self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
-        self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
         self.trans = mk(fg=ACC, font=("Segoe UI", 10))
+        self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
-        self.text_lbls = (self.them_last, self.them_now, self.trans,
+        self.text_lbls = (self.them_last, self.trans, self.them_now,
                           self.me_now)
         for lbl in self.text_lbls:
             lbl.pack(fill="x", padx=12)
