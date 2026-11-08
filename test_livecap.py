@@ -720,6 +720,103 @@ class SupervisorTest(unittest.TestCase):
         self.assertIn(("state", "mic", "ok", ""), states)
 
 
+class DeadCbTest(unittest.TestCase):
+    """H1 — a replaced stream's finished_callback must not flag its
+    successor. PortAudio fires finished_callback on stop()/close()."""
+
+    def _state(self, ev=None):
+        return {"in": None, "out": None, "ring": None, "mic_sr": 16000,
+                "cable_sr": 16000, "mic_dead": False,
+                "cable_dead": False, "ev": ev or threading.Event(),
+                "cands": []}
+
+    def test_generation_guard(self):
+        st = self._state()
+        rep = livecap.Reporter(queue.Queue())
+        cb1 = livecap.dead_cb(st, "mic", rep, "died")
+        livecap.dead_cb(st, "mic", rep, "died")     # new generation
+        cb1()                                     # old stream closed
+        self.assertFalse(st["mic_dead"])          # must NOT flag
+
+    def test_reopen_once(self):
+        """Fake stream whose stop()/close() fire finished_callback —
+        one dead mic => exactly one reopen, mic_dead False at end."""
+        st = self._state()
+        rep = livecap.Reporter(queue.Queue())
+        opens = []
+
+        class FS:
+            def __init__(s):
+                s.cb = None
+            def start(s):
+                pass
+            def stop(s):
+                if s.cb: s.cb()
+            def close(s):
+                if s.cb: s.cb()
+
+        def fake_open(i):
+            opens.append(i)
+            f = FS()
+            f.cb = livecap.dead_cb(st, "mic", rep, "died")
+            return f, 16000
+
+        first, _ = fake_open(0)
+        st["in"] = first
+        st["mic_dead"] = True
+        opens.clear()                      # count supervisor reopens
+        t = threading.Thread(
+            target=livecap.stream_supervisor,
+            args=(st, st["ev"], queue.Queue(), types.SimpleNamespace(
+                frame_shift_in_samples=256), queue.Queue()),
+            kwargs=dict(open_mic_fn=fake_open, pick_fn=lambda: 0,
+                        base=0.01, rep=rep),
+            daemon=True)
+        t.start()
+        time.sleep(0.5)
+        livecap.stop.set(); t.join(2); livecap.stop.clear()
+        self.assertEqual(len(opens), 1)      # no reopen loop
+        self.assertFalse(st["mic_dead"])
+
+
+class SharedRepTest(unittest.TestCase):
+    """H2 — two failure/recovery cycles through mark_dead each end
+    with an ok event when the dedupe memory is shared."""
+
+    def test_two_cycles(self):
+        gui_q = queue.Queue()
+        rep = livecap.Reporter(gui_q)
+        st = {"ev": threading.Event(), "mic_dead": False}
+        for _ in range(2):
+            livecap.mark_dead(st, "mic", rep, "mic stream stopped")
+            rep.set("mic", "ok")
+            st["mic_dead"] = False
+        evs = [gui_q.get_nowait() for _ in range(gui_q.qsize())]
+        oks = [e for e in evs if e == ("state", "mic", "ok", "")]
+        self.assertEqual(len(oks), 2)
+
+
+class DampingTest(unittest.TestCase):
+    """M4 — a 30ms step disturbance must decay below the deadband,
+    not oscillate for minutes (zeta ~0.6)."""
+
+    def test_disturbance_decays(self):
+        sr = 44100
+        ring = livecap.Ring(sr * 2)
+        target = int(0.04 * sr)
+        ring.reset(target)
+        ring.push(np.zeros(int(0.03 * sr), np.float32))  # +30ms step
+        rs = livecap.Resampler(16000, sr)
+        pull = int(round(0.016 * sr))
+        # ~200s of simulated time at 16ms/tick
+        for _ in range(12500):
+            ring.push(rs.resample(np.full(256, 0.1, np.float32)))
+            ring.pull(pull)
+            rs.steer(ring.fill() - target, sr)
+        self.assertLessEqual(abs(ring.fill() - target),
+                             int(0.005 * sr))   # deadband edge ok
+
+
 class RingArmedTest(unittest.TestCase):
     """P7 — muted/empty pulls must not count as underruns."""
 

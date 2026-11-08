@@ -42,6 +42,37 @@ SR = 16000
 stop = threading.Event()
 
 _single = []                                 # keeps the handle alive
+_splash = [None]
+
+
+def _dpi_aware():
+    """System DPI awareness (mode 1) — must run BEFORE any Tk window
+    exists or it renders blurry. Tk 8.6 can't track per-monitor
+    changes anyway."""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+
+
+def run_with_pump(fn, pump, period=0.05):
+    """Run fn on a worker while the main thread pumps the Tk event
+    loop — a frozen window ghosts as 'Not responding' in seconds."""
+    out = {}
+    def w():
+        try:
+            out["v"] = fn()
+        except BaseException as e:
+            out["e"] = e
+    t = threading.Thread(target=w, daemon=True)
+    t.start()
+    while t.is_alive():
+        pump()
+        t.join(period)
+    if "e" in out:
+        raise out["e"]
+    return out["v"]
 
 
 def acquire_single_instance() -> bool:
@@ -76,9 +107,21 @@ def loading_splash():
                  fg="#f9fafb", bg="#101418",
                  font=("Segoe UI", 10)).pack(expand=True)
         sp.update()
+        _splash[0] = sp
         return sp
     except Exception:
         return None
+
+
+def drop_splash():
+    """Destroy the loading splash — called on success AND on every
+    fatal path so it can't linger topmost behind the error box."""
+    sp, _splash[0] = _splash[0], None
+    if sp is not None:
+        try:
+            sp.destroy()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- models
@@ -123,8 +166,8 @@ class Resampler:
         5ms deadband keeps callback jitter from winding it."""
         if abs(err) >= 0.005 * sr:
             self.trim += (err / sr) * 1e-4     # ~16ms cadence
-            prop = max(-0.001, min(0.001,      # damping: ~1/10 the
-                       (err / sr) * 1e-3))     # old proportional gain
+            prop = max(-0.001, min(0.001,      # damping: zeta ~0.6
+                       (err / sr) * 0.1))      # (capped +-0.1%)
         else:                                  # old proportional gain
             prop = 0.0
         self.trim = max(-0.001, min(0.001, self.trim))
@@ -320,15 +363,19 @@ def put_drop(q: queue.Queue, item):
 class Reporter:
     """Emits ('state', comp, lvl, msg) only on transitions — callers can
     report on every chunk/decode without flooding gui_q, and recovery
-    ('ok') clears badges the error path set."""
+    ('ok') clears badges the error path set. Share ONE instance: the
+    dedupe memory is what makes a recovery clear another component's
+    error."""
 
     def __init__(self, q):
         self.q, self.last = q, {}
+        self._lock = threading.Lock()
 
     def set(self, comp, lvl, msg=""):
-        if self.last.get(comp) != (lvl, msg):
-            self.last[comp] = (lvl, msg)
-            put_drop(self.q, ("state", comp, lvl, msg))
+        with self._lock:
+            if self.last.get(comp) != (lvl, msg):
+                self.last[comp] = (lvl, msg)
+                put_drop(self.q, ("state", comp, lvl, msg))
 
 
 def badge_shown(lvl: str) -> bool:
@@ -579,6 +626,8 @@ class Ring:
             self._armed = False
         if prefill:
             self.push(np.zeros(prefill, np.float32))
+            self._armed = False            # prefill isn't real audio —
+                                           # don't count its drains
 
     def drop_to(self, keep: int) -> int:
         """Discard all but the newest `keep` samples — a latency burst
@@ -714,23 +763,53 @@ def open_mic(mic_idx, den, mic_q, gui_q, dead=None):
         callback=cb, finished_callback=stopped, **kw), mic_sr
 
 
-def mark_dead(state, comp, gui_q, msg):
+def mark_dead(state, comp, rep, msg):
     """A stream died — flag it for the supervisor and show the badge."""
-    state[comp + "_dead"] = True
-    state["ev"].set()
-    put_drop(gui_q, ("state", comp, "err", msg))
+    if not state.get(comp + "_dead"):          # transition only —
+        state[comp + "_dead"] = True           # don't spin the wait
+        state["ev"].set()
+    rep.set(comp, "err", msg)
+
+
+def dead_cb(state, comp, rep, msg):
+    """finished_callback for ONE stream generation. PortAudio fires it
+    on stop()/close() too, so a replaced stream must not flag its
+    successor — each new open bumps the generation."""
+    state[comp + "_gen"] = gen = state.get(comp + "_gen", 0) + 1
+
+    def cb():
+        if state.get(comp + "_gen") == gen:
+            mark_dead(state, comp, rep, msg)
+    return cb
+
+
+def _sd_reinit(state, rep):
+    """PortAudio's device list is frozen at Pa_Initialize — only
+    reinit when nothing is streaming, else warn."""
+    if state.get("in") is not None or state.get("out") is not None:
+        rep.set("mic", "warn", "restart to detect new devices")
+        return False
+    try:
+        sd._terminate()
+        sd._initialize()
+        diag("PortAudio reinitialized for new devices")
+        return True
+    except Exception as e:
+        diag(f"sd reinit failed: {e}")
+        return False
 
 
 def stream_supervisor(state, ev, gui_q, den, mic_q,
                       open_mic_fn=None, open_cable_fn=None,
-                      pick_fn=None, base=1.0):
+                      pick_fn=None, base=1.0, rep=None):
     """Reopens dead mic/cable streams with backoff (1,2,5s cap) —
     a USB unplug or driver reset shouldn't need an app restart.
     On success the engine sees the new ring/rates via `state`."""
-    rep = Reporter(gui_q)
+    rep = rep or Reporter(gui_q)
     pick_fn = pick_fn or pick_mic
-    open_mic_fn = open_mic_fn or \
-        (lambda i: open_mic(i, den, mic_q, gui_q))
+    open_mic_fn = open_mic_fn or (lambda i: open_mic(
+        i, den, mic_q, gui_q,
+        dead=dead_cb(state, "mic", rep, "mic stream stopped")))
     if open_cable_fn is None:
         def open_cable_fn():
             def fn(idx, sr, wasapi, ring):
@@ -744,12 +823,13 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                     callback=lambda data, frames, t, s:
                         data.__setitem__((slice(None), 0),
                                         ring.pull(frames)),
-                    finished_callback=lambda: mark_dead(
-                        state, "cable", gui_q, "cable stream stopped"),
+                    finished_callback=dead_cb(
+                        state, "cable", rep, "cable stream stopped"),
                     **kw)
             return open_cable(state["cands"], True, fn)
     backoff = {"mic": base, "cable": base}
     next_try = {"mic": 0.0, "cable": 0.0}
+    fails = {"mic": 0, "cable": 0}
     while not stop.is_set():
         wait = 0.5                      # wake early for a pending retry
         for comp in ("mic", "cable"):
@@ -762,21 +842,28 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
         if state["mic_dead"] and now >= next_try["mic"]:
             try:
                 idx = pick_fn()
+                if idx is None and _sd_reinit(state, rep):
+                    idx = pick_fn()    # re-enumerate for replugs
                 if idx is None:
                     raise RuntimeError("no mic")
                 st, msr = open_mic_fn(idx)
                 st.start()
                 old, state["in"] = state["in"], st
                 state["mic_sr"], state["mic_dead"] = msr, False
+                state["mic_t"] = time.time()   # grace before stall
                 try:
                     if old is not None:
                         old.stop(); old.close()
                 except Exception:
                     pass
                 backoff["mic"] = base
+                fails["mic"] = 0
                 rep.set("mic", "ok")
                 diag(f"mic reopened: dev{idx} {msr}Hz")
             except Exception as e:
+                fails["mic"] += 1
+                if fails["mic"] >= 3:
+                    _sd_reinit(state, rep)
                 next_try["mic"] = now + backoff["mic"]
                 diag(f"mic reopen failed ({e}); "
                      f"retry in {backoff['mic']:.0f}s")
@@ -790,15 +877,20 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 old, state["out"] = state["out"], st2
                 state["ring"], state["cable_sr"] = ring2, csr
                 state["cable_dead"] = False
+                state["cable_t"] = time.time()
                 try:
                     if old is not None:
                         old.stop(); old.close()
                 except Exception:
                     pass
                 backoff["cable"] = base
+                fails["cable"] = 0
                 rep.set("cable", "ok")
                 diag(f"cable reopened: {csr}Hz")
             except Exception as e:
+                fails["cable"] += 1
+                if fails["cable"] >= 3:
+                    _sd_reinit(state, rep)
                 next_try["cable"] = now + backoff["cable"]
                 diag(f"cable reopen failed ({e}); "
                      f"retry in {backoff['cable']:.0f}s")
@@ -827,11 +919,12 @@ def voice_stat(ring, mic_q, micasr_q, avg_ms, max_ms, slow, fails):
 
 
 def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
-                 mic_sr=SR, cable_sr=SR, stall_after=1.5, state=None):
+                 mic_sr=SR, cable_sr=SR, stall_after=1.5, state=None,
+                 rep=None):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue.
     `state` (optional shared dict) lets the stream supervisor swap
     ring/rates on reopen — the engine picks them up per chunk."""
-    rep = Reporter(gui_q)                    # dedupes; ok clears badges
+    rep = rep or Reporter(gui_q)             # dedupes; ok clears badges
     needs_reset = muted = False
     mic_rs = Resampler(mic_sr, SR) if mic_sr != SR else None
     pend = np.empty(0, np.float32)           # native-rate accumulator
@@ -861,11 +954,12 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
         except queue.Empty:                  # the badge even muted
             # chunks keep arriving even while muted — a stall means
             # the device is gone, not silent
-            if time.time() - last_chunk > stall_after:
+            grace = (state or {}).get("mic_t", 0)
+            if time.time() - max(last_chunk, grace) > stall_after:
                 rep.set("mic", "err", "no mic input")
-                if state is not None:
-                    state["mic_dead"] = True
-                    state["ev"].set()
+                if state is not None and not state.get("mic_dead"):
+                    state["mic_dead"] = True    # transition only —
+                    state["ev"].set()           # don't spin the wait
             continue
         if mic_rs is not None:               # native-rate input -> 16k
             pend = np.concatenate((pend, mic_rs.resample(x)))
@@ -921,9 +1015,10 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                 fill = ring.fill()
                 # latency burst? trim can't drain it in reasonable
                 # time — skip to the target and keep the newest audio
-                if fill > target + int(0.06 * cable_sr):
+                if fill > target + int(0.06 * cur_sr[1]):
                     ring.drop_to(target)
-                rs.steer(fill - target, cable_sr)
+                    fill = ring.fill()         # post-trim, not stale
+                rs.steer(fill - target, cur_sr[1])
                 ring.push(rs.resample(y))
             put_drop(micasr_q, y)
             if time.time() - stat_t > 5:
@@ -931,7 +1026,7 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                     # saturated AND still off-target = real skew;
                     # trim alone at the cap is just windup
                     if abs(rs.trim) > 0.0009 and abs(
-                            ring.fill() - target) > 0.01 * cable_sr:
+                            ring.fill() - target) > 0.01 * cur_sr[1]:
                         rep.set("cable", "err", "clock skew saturating")
                     else:
                         rep.set("cable", "ok")
@@ -1122,11 +1217,7 @@ class Overlay:
         self.tr = ""
         self.finals = deque(maxlen=50)
         self.fs, self.alpha = 11, 0.85
-        try:
-            import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
-            pass
+        _dpi_aware()
         r = self.root = tk.Tk()
         # fonts scale with DPI automatically; pixel constants don't —
         # scale them by the same factor (1.0 at 96 DPI)
@@ -1465,6 +1556,7 @@ def main():
     if not acquire_single_instance():
         raise SystemExit("livecap is already running")
 
+    _dpi_aware()                       # before ANY window exists
     splash = loading_splash()        # models take seconds to load —
                                      # show something immediately
 
@@ -1488,11 +1580,20 @@ def main():
         raise SystemExit("missing model files:\n  "
                          + "\n  ".join(str(m) for m in missing))
 
-    den = make_denoiser()
-    diag(f"ASR model: {model_dir.name}")
-    rec, asr_provider = make_recognizer(model_dir)
-    diag(f"ASR provider: {asr_provider}")
-    punct = None if "nemotron" in model_dir.name.lower() else make_punctuator()
+    def _load_models():
+        den = make_denoiser()
+        diag(f"ASR model: {model_dir.name}")
+        rec, asr_provider = make_recognizer(model_dir)
+        diag(f"ASR provider: {asr_provider}")
+        punct = (None if "nemotron" in model_dir.name.lower()
+                 else make_punctuator())
+        return den, rec, punct
+    try:
+        pump = (lambda: splash.update()) if splash else             (lambda: time.sleep(0.05))
+        den, rec, punct = run_with_pump(_load_models, pump)
+    except BaseException:
+        drop_splash()                    # splash must not outlive us
+        raise
     pipe = Pipeline(rec, punct)
 
     status = []
@@ -1502,6 +1603,8 @@ def main():
     qs = queue.Queue(maxsize=64)         # ~2s of 32ms chunks
     gui_q = queue.Queue(maxsize=1024)     # bounded — a stalled overlay
                                           # can't eat RAM
+    rep = Reporter(gui_q)                  # ONE dedupe memory shared
+                                          # by engine, supervisor, cb
     ring, out_stream, cable_sr = None, None, SR
     # shared stream state — the supervisor swaps these on reopen and
     # the voice engine picks them up per chunk
@@ -1528,13 +1631,14 @@ def main():
                 callback=lambda data, frames, t, s:
                     data.__setitem__((slice(None), 0),
                                     ring.pull(frames)),
-                finished_callback=lambda: mark_dead(
-                    state, "cable", gui_q, "cable stream stopped"),
+                finished_callback=dead_cb(
+                    state, "cable", rep, "cable stream stopped"),
                 **kw)
         ring, out_stream, cable_sr = open_cable(
             cands, True, _open_cable)
         if out_stream is None:
             status.append(("cable","err","cable open failed"))
+            mark_dead(state, "cable", rep, "cable open failed")
         else:
             status.append(("cable","ok","cable ✓"))
             diag(f"cable latency: {out_stream.latency}")
@@ -1568,8 +1672,8 @@ def main():
          try:
             st, mic_sr = open_mic(
                 mic_idx, den, mic_q, gui_q,
-                dead=lambda: mark_dead(
-                    state, "mic", gui_q, "mic stream stopped"))
+                dead=dead_cb(state, "mic", rep,
+                             "mic stream stopped"))
             st.start()
             in_stream = st                 # assign only after start()
             state["in"], state["mic_sr"] = st, mic_sr
@@ -1579,6 +1683,7 @@ def main():
          except Exception as e:
             status.append(("mic","warn","no mic"))
             diag(f"no mic input ({e})")
+            mark_dead(state, "mic", rep, "mic open failed")
     if out_stream is not None:
         try:
             out_stream.start()
@@ -1589,6 +1694,8 @@ def main():
             except Exception:
                 pass
             out_stream = ring = None
+            state["ring"] = state["out"] = None
+            mark_dead(state, "cable", rep, "cable start failed")
             status.append(("cable","err","start failed"))
     workers = []
     worker_defs = []
@@ -1600,10 +1707,11 @@ def main():
              dict(args=(mic_q, den, ring, micasr_q, mute, den_off,
                         gui_q),
                   kwargs=dict(mic_sr=mic_sr, cable_sr=cable_sr,
-                              state=state))))
+                              state=state, rep=rep))))
     worker_defs += [
             (stream_supervisor, "stream-sup",
-             dict(args=(state, state["ev"], gui_q, den, mic_q))),
+             dict(args=(state, state["ev"], gui_q, den, mic_q),
+                  kwargs=dict(rep=rep))),
             (loopback_pump, "spk-pump", dict(args=(qs, gui_q))),
             (asr_consumer, "asr-spk",
              dict(args=(pipe, qs, gui_q, log, log_lock,
@@ -1630,8 +1738,7 @@ def main():
     status.append(("log","info","log"))  # model name lives in diag
     diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
-        if splash is not None:
-            splash.destroy()
+        drop_splash()
         Overlay(gui_q, status, mute, den_off,
                 mic_active=in_stream is not None).run()
     finally:
@@ -1644,7 +1751,7 @@ def main():
             log.close()
         except Exception:
             pass
-        for st in (out_stream, in_stream):    # each op guarded — a
+        for st in (state["out"], state["in"]):  # live streams, not
             if st is None:                    # failed stop() must not
                 continue                      # skip the other stream
             try:
@@ -1668,6 +1775,7 @@ def main():
 def _fatal_box(msg):
     """Console may be hidden in the built exe — surface fatal startup
     failures as a dialog, not silence."""
+    drop_splash()
     try:
         import ctypes
         ctypes.windll.user32.MessageBoxW(0, msg, "livecap", 0x10)
