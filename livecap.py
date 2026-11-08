@@ -212,7 +212,8 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
     except Exception as e:
         put_drop(gui_q, ("trans", f"[translation unavailable: {e}]"))
         return
-    gmap = {"zh-CN": "zh-CN", "zh-TW": "zh-TW", "nb-NO": "no"}
+    gmap = {"zh-CN": "zh-CN", "zh-TW": "zh-TW", "zh-HK": "zh-TW",
+            "nb-NO": "no", "he": "iw"}   # he/zh-HK rejected by Google
     gcode = gmap.get(lang, lang.split("-")[0])
     try:
         tr = GoogleTranslator(source="en", target=gcode)
@@ -230,33 +231,37 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
     warned = False
     while not stop.is_set():
         try:
-            text = tq.get(timeout=0.1)
+            sid, text = tq.get(timeout=0.1)
         except queue.Empty:
             continue
         while True:                        # keep only the newest segment
             try:
-                text = tq.get_nowait()
+                item = tq.get_nowait()
+                with log_lock:             # attribute skipped ids
+                    log.write(f"    -> (skipped seg {item[0]})\n")
+                sid, text = item
             except queue.Empty:
                 break
-        out = None
+        out, reason = None, None
         try:
             if tr is not None:
                 out = tr.translate(text)
-        except Exception:
-            pass
+        except Exception as e:
+            reason = type(e).__name__
         if out is None and fallback is not None:
             try:
                 out = fallback.translate(text)
-            except Exception:
-                pass
+            except Exception as e:
+                reason = reason or type(e).__name__
         if out:
             warned = False
             put_drop(gui_q, ("trans", out))
             with log_lock:
-                log.write(f"    -> {out}\n")
+                log.write(f"    -> {out}  (seg {sid})\n")
         elif not warned:                   # visible once, not per call
             warned = True
-            put_drop(gui_q, ("trans", "[translation paused — rate limit]"))
+            put_drop(gui_q, ("trans",
+                             f"[translation paused: {reason or 'unknown'}]"))
 
 
 # ------------------------------------------------------------------- asr
@@ -289,13 +294,22 @@ class Pipeline:
             self.partials[tag] = result_text(
                 self.rec.get_result(stream)).strip()
 
-    def flush(self):
+    def flush(self, tag):
+        """Force-finalize one stream (per consumer); returns pending
+        text or None. Padding silence is required — streaming
+        transducers drop final tokens without it."""
+        stream = self.streams.get(tag)
+        if stream is None:
+            return None
         pad = np.zeros(int(0.75 * SR), dtype=np.float32)
-        for stream in self.streams.values():
-            stream.accept_waveform(SR, pad)
-            stream.input_finished()
-            while self.rec.is_ready(stream):
-                self.rec.decode_stream(stream)
+        stream.accept_waveform(SR, pad)
+        stream.input_finished()
+        while self.rec.is_ready(stream):
+            self.rec.decode_stream(stream)
+        text = result_text(self.rec.get_result(stream)).strip()
+        self.streams.pop(tag, None)
+        return (self.punct.add_punctuation_with_case(text.lower())
+                if text and self.punct else (text or None))
 
 
 # ------------------------------------------------------ mic -> denoise ->
@@ -445,6 +459,12 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
             stat_n += 1
             if time.time() - stat_t > 5:
                 fill = ring.fill() if ring else 0
+                if rs is not None and abs(
+                        rs.step - rs.base_step) / rs.base_step > 0.0009 \
+                        and not getattr(rs, "_sat", False):
+                    rs._sat = True
+                    put_drop(gui_q, ("err",
+                                     "clock skew saturating resampler"))
                 diag(f"stat ring={fill} mic_q={mic_q.qsize()} "
                      f"micasr={micasr_q.qsize()} "
                      f"denoise={stat_ms/max(stat_n,1):.1f}ms")
@@ -540,11 +560,21 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None):
     speaker decode on CPU-only boxes. tag: 'spk' or 'mic'."""
     last_p = {}
     stat_a = stat_d = 0.0                  # audio seconds, decode seconds
-    stat_t = time.time()
+    stat_t = last_chunk = time.time()
+    trans_seq = [0]
     while not stop.is_set():
         try:
             chunk = q.get(timeout=0.02)
+            last_chunk = time.time()
         except queue.Empty:
+            # loopback may stop delivering on silence — feed zeros so
+            # the endpoint rule still finalizes the utterance
+            if pipe.partials.get(tag) \
+                    and time.time() - last_chunk > 1.0:
+                try:
+                    pipe.feed(np.zeros(1024, np.float32), tag)
+                except Exception:
+                    pass
             continue
         if isinstance(chunk, tuple):      # ("err", exc) from loopback
             put_drop(gui_q, ("err",
@@ -564,7 +594,8 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None):
                     log.write(f"[{time.strftime('%H:%M:%S')}] "
                               f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
                 if trans_q is not None:
-                    put_drop(trans_q, final)
+                    trans_seq[0] += 1
+                    put_drop(trans_q, (trans_seq[0], final))
                 put_drop(gui_q, ("final", tag, final))
                 last_p.pop(tag, None)      # reset dedup for next utterance
             elif pipe.partials.get(tag):
@@ -578,6 +609,12 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None):
                     put_drop(gui_q, ("partial", tag, p))
         except Exception as e:
             put_drop(gui_q, ("err", f"ASR {tag} decode error: {e}"))
+    final = pipe.flush(tag)                # emit the last utterance
+    if final:
+        with log_lock:
+            log.write(f"[{time.strftime('%H:%M:%S')}] "
+                      f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
+        put_drop(gui_q, ("final", tag, final))
 
 
 # ------------------------------------------------------------------ overlay
@@ -750,6 +787,11 @@ class Overlay:
             return
         self._esc_armed = now + 2.5
         self.them_now.config(text="press Esc again to quit")
+        self.root.after(2600, self._esc_clear)
+
+    def _esc_clear(self):
+        if getattr(self, "_esc_armed", 0) <= time.time():
+            self.them_now.config(text=self.them.get("now", ""))
 
     def tgl_mute(self):
         if not self.mic_active:
@@ -949,23 +991,26 @@ def main():
             diag(f"no mic input ({e})")
     if out_stream is not None:
         out_stream.start()
-    threading.Thread(target=voice_engine, daemon=True,
-                     args=(mic_q, den, ring, cable_sr, micasr_q,
-                           mute, den_off, gui_q)).start()
-    threading.Thread(target=loopback_pump, daemon=True,
-                     args=(qs, gui_q)).start()
-    threading.Thread(target=asr_consumer, name="asr-spk", daemon=True,
-                     args=(pipe, qs, gui_q, log, log_lock, "spk",
-                           trans_q)).start()
-    threading.Thread(target=asr_consumer, name="asr-mic", daemon=True,
-                     args=(pipe, micasr_q, gui_q, log, log_lock,
-                           "mic")).start()
+    workers = []
+    for tgt, kw in (
+            (voice_engine, dict(args=(mic_q, den, ring, cable_sr,
+                                      micasr_q, mute, den_off, gui_q))),
+            (loopback_pump, dict(args=(qs, gui_q))),
+            (asr_consumer, dict(args=(pipe, qs, gui_q, log, log_lock,
+                                      "spk", trans_q))),
+            (asr_consumer, dict(args=(pipe, micasr_q, gui_q, log,
+                                      log_lock, "mic")))):
+        t = threading.Thread(target=tgt, daemon=True, **kw)
+        t.start()
+        workers.append(t)
     if trans_q is not None:
         status.append(f"trans→{args.lang}")
-        threading.Thread(target=translator_worker, daemon=True,
-                         args=(trans_q, gui_q, log, log_lock,
-                               lang_code(args.lang),
-                               args.trans_email)).start()
+        t = threading.Thread(target=translator_worker, daemon=True,
+                             args=(trans_q, gui_q, log, log_lock,
+                                   lang_code(args.lang),
+                                   args.trans_email))
+        t.start()
+        workers.append(t)
 
     status.append(model_dir.name[:30])
     diag("livecap running — mic -> denoise -> cable, captions for both")
@@ -974,6 +1019,8 @@ def main():
                 mic_active=in_stream is not None).run()
     finally:
         stop.set()
+        for w in workers:                # let workers flush + emit
+            w.join(timeout=3)
         log.close()
         if out_stream is not None:
             out_stream.stop()
