@@ -409,10 +409,12 @@ def cable_usable() -> bool:
 
 
 def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
-                 gui_q):
+                 gui_q, mic_sr=SR):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue."""
     needs_reset = False
     den_fails = 0                            # consecutive denoise errors
+    mic_rs = Resampler(mic_sr, SR) if mic_sr != SR else None
+    pend = np.empty(0, np.float32)           # native-rate accumulator
     rs = Resampler(SR, cable_sr) if ring is not None else None
     target = int(0.04 * cable_sr)            # ~40ms target ring fill
     stat_t, stat_n, stat_ms = time.time(), 0, 0.0
@@ -421,6 +423,12 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
             x = mic_q.get(timeout=0.02)
         except queue.Empty:
             continue
+        if mic_rs is not None:               # native-rate input -> 16k
+            pend = np.concatenate((pend, mic_rs.resample(x)))
+            if len(pend) < den.frame_shift_in_samples:
+                continue
+            x, pend = (pend[:den.frame_shift_in_samples],
+                       pend[den.frame_shift_in_samples:])
         try:
             if mute.is_set():                # hard mute: nothing leaves
                 needs_reset = True
@@ -990,7 +998,7 @@ def main():
         put_drop(gui_q, ("state", "worker", "err", f"{a.thread.name} died")))
     trans_q = queue.Queue(maxsize=4) if args.lang else None
 
-    in_stream = None
+    in_stream, mic_sr = None, SR
     if out_stream is None:
         status.append(("mic","warn","mic off"))
     else:
@@ -999,14 +1007,32 @@ def main():
             status.append(("mic","warn","no mic"))
         else:
          try:
-            st = sd.InputStream(
-                device=mic_idx,
-                samplerate=SR, channels=1, dtype="float32",
-                blocksize=den.frame_shift_in_samples,
-                callback=lambda d, f, t, s: put_drop(mic_q, d[:, 0].copy()))
+            mic_sr = SR
+            try:
+                st = sd.InputStream(
+                    device=mic_idx,
+                    samplerate=SR, channels=1, dtype="float32",
+                    blocksize=den.frame_shift_in_samples,
+                    callback=lambda d, f, t, s: put_drop(
+                        mic_q, d[:, 0].copy()))
+            except Exception:
+                # device rejects 16kHz (WASAPI shared) — open at its
+                # native rate; the engine resamples with the same
+                # stateful resampler
+                mic_sr = int(sd.query_devices(
+                    mic_idx)["default_samplerate"])
+                st = sd.InputStream(
+                    device=mic_idx,
+                    samplerate=mic_sr, channels=1, dtype="float32",
+                    blocksize=int(den.frame_shift_in_samples
+                                  * mic_sr / SR),
+                    callback=lambda d, f, t, s: put_drop(
+                        mic_q, d[:, 0].copy()))
             st.start()
             in_stream = st                 # assign only after start()
             status.append(("mic","ok","mic ✓"))
+            if mic_sr != SR:
+                diag(f"mic opened at {mic_sr}Hz, resampling to 16k")
          except Exception as e:
             status.append(("mic","warn","no mic"))
             diag(f"no mic input ({e})")
@@ -1015,7 +1041,8 @@ def main():
     workers = []
     for tgt, kw in (
             (voice_engine, dict(args=(mic_q, den, ring, cable_sr,
-                                      micasr_q, mute, den_off, gui_q))),
+                                      micasr_q, mute, den_off, gui_q,
+                                      mic_sr))),
             (loopback_pump, dict(args=(qs, gui_q))),
             (asr_consumer, dict(args=(pipe, qs, gui_q, log, log_lock,
                                       "spk", trans_q))),
