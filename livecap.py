@@ -622,12 +622,11 @@ def main():
     cable_idx, cable_sr = find_cable()
     ring = out_stream = None
     if cable_idx is None:
-        status.append("no VB-CABLE — install it, then pick 'CABLE "
-                      "Output' as your mic in the call app")
+        status.append("no VB-CABLE")
         print("VB-CABLE not found — captions only, no mic passthrough",
               file=sys.stderr)
     elif not cable_usable():
-        status.append("cable hidden from apps — mic off")
+        status.append("cable hidden")
         print("cable not visible to apps (session) — mic capture off",
               file=sys.stderr)
     else:
@@ -641,7 +640,7 @@ def main():
             status.append("cable ✓")
         except Exception as e:
             ring = out_stream = None
-            status.append(f"cable open failed ({e}) — captions only")
+            status.append("cable open failed")
             print(f"cable found but won't open ({e}) — captions only",
                   file=sys.stderr)
 
@@ -659,7 +658,7 @@ def main():
 
     in_stream = None
     if out_stream is None:
-        status.append("mic off — no passthrough")
+        status.append("mic off")
     else:
         try:
             in_stream = sd.InputStream(
@@ -669,7 +668,7 @@ def main():
             in_stream.start()
             status.append("mic ✓")
         except Exception as e:
-            status.append("no mic — speaker captions only")
+            status.append("no mic")
             print(f"no mic input ({e})", file=sys.stderr)
     if out_stream is not None:
         out_stream.start()
