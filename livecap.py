@@ -142,22 +142,31 @@ def result_text(res) -> str:
 
 
 _diag_log = [None]
+_diag_q = queue.Queue(maxsize=512)
+
+
+def _diag_writer():
+    """Drains diag lines to stderr + the log file — writers never block
+    on a stalled disk."""
+    while True:
+        try:
+            line = _diag_q.get()
+            if sys.stderr is not None:
+                sys.stderr.write(line + "\n")
+            if _diag_log[0] is not None:
+                _diag_log[0].write(line + "\n")
+        except Exception:
+            pass
+
+
+threading.Thread(target=_diag_writer, daemon=True,
+                 name="diag-writer").start()
 
 
 def diag(msg):
-    """Diagnostics channel — stderr when it exists (windowed builds can
-    have sys.stderr=None) plus a rotating log in the logs folder."""
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
-    try:
-        if sys.stderr is not None:
-            sys.stderr.write(line + "\n")
-    except Exception:
-        pass
-    try:
-        if _diag_log[0] is not None:
-            _diag_log[0].write(line + "\n")
-    except Exception:
-        pass
+    """Diagnostics channel — non-blocking: stderr (when it exists;
+    windowed builds can have sys.stderr=None) + rotating log."""
+    put_drop(_diag_q, f"[{time.strftime('%H:%M:%S')}] {msg}")
 
 
 def put_drop(q: queue.Queue, item):
@@ -270,6 +279,7 @@ class Pipeline:
         self.punct = punct
         self.streams = {}
         self.partials = {}
+        self.lock = threading.Lock()   # serialize decode across streams
 
     def feed(self, samples: np.ndarray, tag: str):
         stream = self.streams.get(tag)
@@ -279,8 +289,9 @@ class Pipeline:
         if not len(samples):
             return
         stream.accept_waveform(SR, samples)
-        while self.rec.is_ready(stream):
-            self.rec.decode_stream(stream)
+        with self.lock:                  # one recognizer, two consumers
+            while self.rec.is_ready(stream):
+                self.rec.decode_stream(stream)
         if self.rec.is_endpoint(stream):
             text = result_text(self.rec.get_result(stream)).strip()
             self.rec.reset(stream)
@@ -931,6 +942,9 @@ def main():
     ap.add_argument("--lang", metavar="CODE", default="ja",
                     help="translate [them] captions to this language "
                          "(e.g. ko, ja, vi, zh-CN; default: ja)")
+    ap.add_argument("--log-days", metavar="N", type=int, default=0,
+                    help="delete transcripts older than N days "
+                         "(default: keep)")
     ap.add_argument("--trans-email", metavar="EMAIL",
                     default=os.environ.get("LIVECAP_TRANS_EMAIL"),
                     help="email for MyMemory — raises free quota ~10x "
@@ -988,10 +1002,24 @@ def main():
     mute, den_off = threading.Event(), threading.Event()
     log_lock = threading.Lock()
     LOGS.mkdir(parents=True, exist_ok=True)
+    # preflight: model files must exist before sherpa — clearer than a
+    # native error when the console is hidden
+    for need in ("tokens.txt",):
+        if not (model_dir / need).exists():
+            raise SystemExit(f"missing model file: {model_dir / need}")
+    # log retention: sweep transcripts older than --log-days (0 = keep)
+    if getattr(args, "log_days", 0):
+        cutoff = time.time() - args.log_days * 86400
+        for f in LOGS.glob("livecap-*.txt"):
+            if f.stat().st_mtime < cutoff:
+                f.unlink(missing_ok=True)
     log = open(LOGS / f"livecap-{time.strftime('%Y%m%d-%H%M%S')}.txt",
                "w", encoding="utf-8", buffering=1)
-    _diag_log[0] = open(LOGS / "livecap-diag.log", "a",
-                        encoding="utf-8", buffering=1)
+    # rotate diag: >2MB -> .1, fresh file
+    dp = LOGS / "livecap-diag.log"
+    if dp.exists() and dp.stat().st_size > 2 * 1024 * 1024:
+        dp.replace(LOGS / "livecap-diag.1.log")
+    _diag_log[0] = open(dp, "a", encoding="utf-8", buffering=1)
     sys.excepthook = lambda t, v, tb: diag(f"fatal: {v}")
     threading.excepthook = lambda a: (
         diag(f"thread {a.thread.name} died: {a.exc_value}"),
@@ -1061,6 +1089,7 @@ def main():
         workers.append(t)
 
     status.append(("model","info",model_dir.name[:24]))
+    status.append(("log","info","logging to disk"))
     diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
         Overlay(gui_q, status, mute, den_off,
