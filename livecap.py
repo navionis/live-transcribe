@@ -401,7 +401,7 @@ class Overlay:
         self._ctl(top, "×", self.close)
 
         self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
-        self.trans = mk(fg=ACC, font=("Segoe UI", 10))
+        self.trans = mk(fg=ACC, font=("Segoe UI", self.fs - 3))
         self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
         self.text_lbls = (self.them_last, self.trans, self.them_now,
@@ -475,6 +475,7 @@ class Overlay:
             self.fs = max(8, min(20, self.fs + (1 if e.delta > 0 else -1)))
             self.them_last.config(font=("Segoe UI", self.fs - 1))
             self.them_now.config(font=("Segoe UI", self.fs))
+            self.trans.config(font=("Segoe UI", self.fs - 3))
             self.me_now.config(font=("Segoe UI", self.fs - 1))
         else:                                    # wheel: opacity
             self.alpha = max(0.35, min(1.0,
