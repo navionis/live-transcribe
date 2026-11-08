@@ -80,7 +80,14 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   re-enumeration). `_sd_reinit` itself closes whatever's still live
   and marks it dead (~1s passthrough gap) — a replugged device is
   invisible in the frozen PortAudio list without it; `state["cands"]`
-  is refreshed post-reinit since indices shift
+  is refreshed post-reinit since indices shift. 30s global cooldown
+  (`reinit_t`) — mic and cable failures can't bounce each other.
+  `cable_absent` (cable missing/hidden at startup) -> supervisor
+  rescans every 10s via `cable_usable_threaded()` (COM on that
+  thread) + `_sd_reinit` -> "cable discovered"
+- `voice_engine` drains stale device chunks + resets
+  resampler/pend/denoiser when `mic_t` bumps (supervisor reopen
+  marker) — a same-rate replug leaves no leftover fragment
 - `voice_engine` runs unconditionally — a mic/cable that failed at
   startup is reopened by the supervisor and the running engine
   consumes it (its own stall detector does the dead-marking)
@@ -154,6 +161,9 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - finals-only, drain-to-latest queue; quota errors show
   `[translation paused — rate limit]` once; `--trans-email` /
   `LIVECAP_TRANS_EMAIL` raises MyMemory free quota ~10x
+- seg ids tag `final`+`trans` events — the overlay drops a
+  translation whose seg isn't current (a translation can't beat its
+  own caption: the final is queued before the translate request)
 
 ## Logs / paths
 

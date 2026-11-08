@@ -489,13 +489,14 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
                 reason = reason or type(e).__name__
         if out:
             warned = False
-            put_drop(gui_q, ("trans", out))
+            put_drop(gui_q, ("trans", out, sid))
             with log_lock:
                 log.write(f"    -> {out}  (seg {sid})\n")
         elif not warned:                   # visible once, not per call
             warned = True
             put_drop(gui_q, ("trans",
-                             f"[translation paused: {reason or 'unknown'}]"))
+                             f"[translation paused: {reason or 'unknown'}]",
+                             sid))
 
 
 # ------------------------------------------------------------------- asr
@@ -710,6 +711,23 @@ def cable_usable() -> bool:
         return False
 
 
+def cable_usable_threaded() -> bool:
+    """soundcard needs COM on the calling thread — the supervisor
+    thread has none. Init, check, uninit."""
+    import ctypes
+    ci = False
+    try:
+        ctypes.windll.ole32.CoInitialize(None)
+        ci = True
+    except Exception:
+        pass
+    try:
+        return cable_usable()
+    finally:
+        if ci:
+            ctypes.windll.ole32.CoUninitialize()
+
+
 def open_cable(cands, usable, open_fn):
     """Try cable candidates in order. open_fn(idx, sr, wasapi, ring)
     returns a stream or raises. Never raises — returns
@@ -789,6 +807,10 @@ def _sd_reinit(state, rep):
     ~1s passthrough gap, but a replugged device is INVISIBLE without
     it (frozen list returns stale indices forever). Whatever we close
     is marked dead so the supervisor reopens it next pass."""
+    now = time.time()
+    if now - state.get("reinit_t", 0.0) < 30.0:
+        return False                 # one global cooldown: mic and cable
+    state["reinit_t"] = now          # failures can't bounce each other
     live = {"in": state.get("in"), "out": state.get("out")}
     if live["out"] is not None:
         state["out"], state["ring"] = None, None
@@ -848,6 +870,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
     backoff = {"mic": base, "cable": base}
     next_try = {"mic": 0.0, "cable": 0.0}
     fails = {"mic": 0, "cable": 0}
+    next_scan = 0.0                      # cable rediscovery cadence
     while not stop.is_set():
         wait = 0.5                      # wake early for a pending retry
         for comp in ("mic", "cable"):
@@ -857,6 +880,18 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
         ev.wait(wait)
         ev.clear()
         now = time.time()
+        # cable installed/enabled mid-session: rescan on a cadence —
+        # it only becomes visible after a PortAudio reinit (which the
+        # 30s cooldown bounds); costs the mic ~1s once
+        if state.get("cable_absent") and now >= next_scan:
+            next_scan = now + 10
+            if cable_usable_threaded() and _sd_reinit(state, rep):
+                if state["cands"]:
+                    state["cable_absent"] = False
+                    state["cable_dead"] = True     # existing reopen path
+                    next_try["cable"] = 0.0
+                    ev.set()
+                    diag("cable discovered")
         if state["mic_dead"] and now >= next_try["mic"]:
             old = state["in"]
             if old is not None:                # drop the dead stream
@@ -961,6 +996,7 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
     stat_t, stat_dn, stat_ms = time.time(), 0, 0.0
     stat_max = stat_slow = den_fails = 0
     last_chunk = time.time()
+    seen_mt = 0                        # mic_t generation marker
     while not stop.is_set():
         if state is not None:                # supervisor may have
             ring = state["ring"]             # swapped these on reopen
@@ -975,6 +1011,19 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                 rs = Resampler(SR, cur_sr[1]) \
                     if ring is not None else None
                 target = int(0.04 * cur_sr[1])
+            mt = state.get("mic_t", 0)
+            if mt != seen_mt:          # a NEW mic stream, not a stall —
+                seen_mt = mt           # drop chunks the dead device left
+                try:
+                    while True:
+                        mic_q.get_nowait()
+                except queue.Empty:
+                    pass
+                pend = np.empty(0, np.float32)
+                mic_rs = Resampler(cur_sr[0], SR) \
+                    if cur_sr[0] != SR else None
+                needs_reset = True     # den.reset() before next frame
+                last_chunk = time.time()
         try:
             x = mic_q.get(timeout=0.02)
             last_chunk = time.time()
@@ -1210,18 +1259,20 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
 
     def emit(final):
         """One final, one fate: transcript log (with seg id so the
-        translation lines match), translate, GUI, dedup reset."""
-        seg = ""
+        translation lines match), translate, GUI, dedup reset. The
+        final reaches the GUI before the translation is queued, so a
+        translation can never beat its own caption to the overlay."""
+        seq = 0
         if trans_q is not None:
             trans_seq[0] += 1
-            if put_drop(trans_q, (trans_seq[0], final)):
-                with log_lock:             # eviction skips a seg too
-                    log.write("    -> (trans_q full: seg dropped)\n")
-            seg = f"  [seg {trans_seq[0]}]"
+            seq = trans_seq[0]
         with log_lock:
-            log.write(f"[{time.strftime('%H:%M:%S')}] "
-                      f"[{who}] {final}{seg}\n")
-        put_drop(gui_q, ("final", tag, final))
+            log.write(f"[{time.strftime('%H:%M:%S')}] [{who}] {final}"
+                      + (f"  [seg {seq}]" if seq else "") + "\n")
+        put_drop(gui_q, ("final", tag, final, seq))
+        if trans_q is not None and put_drop(trans_q, (seq, final)):
+            with log_lock:                 # eviction skips a seg too
+                log.write("    -> (trans_q full: seg dropped)\n")
         last_p.pop(tag, None)              # reset dedup for next utterance
 
     while not stop.is_set():
@@ -1297,6 +1348,7 @@ class Overlay:
         self.them = {"last": "", "now": ""}
         self.me = ""
         self.tr = ""
+        self.seg = 0
         self.finals = deque(maxlen=50)
         self.fs, self.alpha = 11, 0.85
         _dpi_aware()
@@ -1565,17 +1617,19 @@ class Overlay:
                     else:
                         self.me = "you: " + text
                 elif ev[0] == "final":
-                    _, tag, text = ev
+                    _, tag, text, *rest = ev
                     self.finals.append(
                         ("them" if tag == "spk" else "you") + ": " + text)
                     if tag == "spk":
                         self.them["last"], self.them["now"] = text, ""
+                        self.seg = rest[0] if rest else 0
                         self.tr = ""         # the old seg's
                                              # translation is stale
                     else:
                         self.me = "you: " + text
                 elif ev[0] == "trans":
-                    self.tr = ev[1]
+                    if len(ev) < 3 or ev[2] == self.seg:
+                        self.tr = ev[1]      # stale segments dropped
                 elif ev[0] == "hotkey":
                     if ev[1] == "mute":
                         self.tgl_mute()
@@ -1699,13 +1753,16 @@ def main():
     # the voice engine picks them up per chunk
     state = {"in": None, "out": None, "ring": None, "mic_sr": SR,
              "cable_sr": SR, "mic_dead": False, "cable_dead": False,
+             "reinit_t": 0.0,
              "ev": threading.Event(), "cands": []}
     cands = cable_candidates()
     state["cands"] = cands
     if not cands:
+        state["cable_absent"] = True
         status.append(("cable","warn","no VB-CABLE"))
         diag("VB-CABLE not found — captions only, no mic passthrough")
     elif not cable_usable():
+        state["cable_absent"] = True
         status.append(("cable","warn","cable hidden"))
         diag("cable not visible to apps (session) — mic capture off")
     else:

@@ -195,7 +195,7 @@ class SilenceFinalTest(unittest.TestCase):
             except queue.Empty:
                 break
         finals = [e for e in events if e[0] == "final"]
-        self.assertEqual(finals, [("final", "spk", "last words")])
+        self.assertEqual(finals, [("final", "spk", "last words", 1)])
         self.assertIn("[them] last words  [seg 1]", log.getvalue())
         self.assertEqual(trans_q.get_nowait(), (1, "last words"))
 
@@ -764,6 +764,62 @@ class SupervisorTest(unittest.TestCase):
         self.assertEqual(state["mic_sr"], 48000)  # new rate reported
         states = [gui_q.get_nowait() for _ in range(gui_q.qsize())]
         self.assertIn(("state", "mic", "ok", ""), states)
+
+
+class ReinitCooldownTest(unittest.TestCase):
+    """One global cooldown — a second _sd_reinit within 30s returns
+    False, so mic and cable failures can't bounce each other."""
+
+    def test_second_call_blocked(self):
+        sd = mock.Mock()
+        state = {"in": None, "out": None, "ring": None,
+                 "reinit_t": 0.0, "cands": [], "ev": threading.Event()}
+        rep = livecap.Reporter(queue.Queue())
+        with mock.patch.object(livecap, "sd", sd), \
+                mock.patch.object(livecap, "cable_candidates",
+                                  return_value=[(0, 48000, True)]):
+            self.assertTrue(livecap._sd_reinit(state, rep))
+            self.assertFalse(livecap._sd_reinit(state, rep))
+            self.assertEqual(sd._terminate.call_count, 1)
+            self.assertEqual(state["cands"], [(0, 48000, True)])
+
+
+class MicReopenResetTest(unittest.TestCase):
+    """A supervisor mic reopen bumps mic_t — the engine must reset the
+    denoiser so stale device state can't leak into the new stream."""
+
+    def test_den_reset_on_mic_t_bump(self):
+        class Den(_FakeDen):
+            resets = [0]
+            def reset(self):
+                Den.resets[0] += 1
+
+        mic_q, micasr_q, gui_q = (queue.Queue(), queue.Queue(),
+                                  queue.Queue())
+        mute, den_off = threading.Event(), threading.Event()
+        state = {"in": None, "out": None, "ring": None,
+                 "mic_sr": livecap.SR, "cable_sr": livecap.SR,
+                 "mic_dead": False, "cable_dead": False,
+                 "ev": threading.Event()}
+        t = threading.Thread(
+            target=livecap.voice_engine,
+            args=(mic_q, Den(), None, micasr_q, mute, den_off,
+                  gui_q),
+            kwargs=dict(mic_sr=livecap.SR, cable_sr=livecap.SR,
+                        state=state),
+            daemon=True)
+        t.start()
+        mic_q.put(np.zeros(256, np.float32))
+        time.sleep(0.2)                    # normal chunk: no reset
+        self.assertEqual(Den.resets[0], 0)
+        state["mic_t"] = time.time()       # supervisor reopen marker
+        time.sleep(0.15)                   # let the drain fire
+        mic_q.put(np.zeros(256, np.float32))
+        time.sleep(0.2)
+        livecap.stop.set()
+        t.join(2)
+        livecap.stop.clear()
+        self.assertEqual(Den.resets[0], 1)
 
 
 class DeadCbTest(unittest.TestCase):
