@@ -78,11 +78,15 @@ class Resampler:
         self.tail = float(buf[-1])
         return y.astype(np.float32)
 
-    def steer(self, err: int):
-        """Nudge the rate toward a target ring fill: err>0 = ring is
-        overfull, output slightly faster; capped at +-0.1%."""
-        adj = max(-0.001, min(0.001, err / 441000.0))
-        self.step = self.base_step / (1 + adj)
+    def steer(self, err: int, sr: int):
+        """Closed-loop rate correction toward a target ring fill.
+        err>0 = ring overfull -> larger step (more input consumed per
+        output sample) -> fewer samples pushed. Deadband keeps
+        callback-block jitter from chattering; +-0.1% cap."""
+        dead = 0.005 * sr
+        adj = 0.0 if abs(err) < dead else max(
+            -0.001, min(0.001, err / (100.0 * sr)))
+        self.step = self.base_step * (1 + adj)
 
 
 def asr_dir() -> Path:
@@ -137,24 +141,66 @@ def make_punctuator():
     return sherpa_onnx.OnlinePunctuation(cfg)
 
 
+def preflight(root: Path, model_dir):
+    """Every file sherpa will hard-exit on if missing — checked before
+    any sherpa call so the failure is one clear message, not a silent
+    process exit in the windowed build. Returns missing paths."""
+    missing = []
+    models = root / "models"
+    if not models.is_dir():
+        return [models]
+    if not (models / "gtcrn_simple.onnx").is_file():
+        missing.append(models / "gtcrn_simple.onnx")
+    if model_dir is None:
+        missing.append("ASR model dir (with tokens.txt) under models/")
+    else:
+        if not (model_dir / "tokens.txt").is_file():
+            missing.append(model_dir / "tokens.txt")
+        for pat in ("encoder*.onnx", "decoder*.onnx", "joiner*.onnx"):
+            if not list(model_dir.glob(pat)):
+                missing.append(model_dir / pat)
+        if "nemotron" not in model_dir.name.lower():
+            punct = models / PUNCT_DIR.name
+            for f in ("model.int8.onnx", "bpe.vocab"):
+                if not (punct / f).is_file():
+                    missing.append(punct / f)
+    return missing
+
+
 def result_text(res) -> str:
     return res if isinstance(res, str) else getattr(res, "text", str(res))
 
 
 _diag_log = [None]
+_diag_path = [None]
+_diag_size = [0]
 _diag_q = queue.Queue(maxsize=512)
 
 
 def _diag_writer():
     """Drains diag lines to stderr + the log file — writers never block
-    on a stalled disk."""
+    on a stalled disk. Rotates by size mid-run, not just at startup."""
     while True:
         try:
             line = _diag_q.get()
             if sys.stderr is not None:
                 sys.stderr.write(line + "\n")
-            if _diag_log[0] is not None:
-                _diag_log[0].write(line + "\n")
+            f = _diag_log[0]
+            if f is None:
+                continue
+            f.write(line + "\n")
+            _diag_size[0] += len(line) + 1
+            if _diag_size[0] > 2 * 1024 * 1024:
+                _diag_size[0] = 0
+                _diag_log[0] = None
+                try:
+                    f.close()
+                    _diag_path[0].replace(
+                        _diag_path[0].with_name("livecap-diag.1.log"))
+                    _diag_log[0] = open(_diag_path[0], "a",
+                                        encoding="utf-8", buffering=1)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -184,6 +230,26 @@ def put_drop(q: queue.Queue, item):
             pass
 
 
+class Reporter:
+    """Emits ('state', comp, lvl, msg) only on transitions — callers can
+    report on every chunk/decode without flooding gui_q, and recovery
+    ('ok') clears badges the error path set."""
+
+    def __init__(self, q):
+        self.q, self.last = q, {}
+
+    def set(self, comp, lvl, msg=""):
+        if self.last.get(comp) != (lvl, msg):
+            self.last[comp] = (lvl, msg)
+            put_drop(self.q, ("state", comp, lvl, msg))
+
+
+def badge_shown(lvl: str) -> bool:
+    """Only warn/err get badges — ok folds into the dot, info into the
+    single compact chip, so the status row stays inside the window."""
+    return lvl in ("warn", "err")
+
+
 def lang_code(code: str) -> str:
     """Normalize 'ko' -> 'ko-KR' style codes for the translator."""
     code = code.strip().lower()
@@ -209,7 +275,10 @@ def lang_code(code: str) -> str:
     }
     if code in special:
         return special[code]
-    return code if "-" in code else f"{code}-{code.upper()}"
+    if "-" in code:                      # ll-rr -> ll-RR (zh-cn -> zh-CN)
+        lang, _, region = code.partition("-")
+        return f"{lang}-{region.upper()}"
+    return f"{code}-{code.upper()}"
 
 
 def translator_worker(tq, gui_q, log, log_lock, lang, email):
@@ -220,7 +289,7 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
         put_drop(gui_q, ("trans", f"[translation unavailable: {e}]"))
         return
     gmap = {"zh-CN": "zh-CN", "zh-TW": "zh-TW", "zh-HK": "zh-TW",
-            "nb-NO": "no", "he": "iw"}   # he/zh-HK rejected by Google
+            "nb-NO": "no", "he-IL": "iw"}   # he/zh-HK rejected by Google
     gcode = gmap.get(lang, lang.split("-")[0])
     try:
         tr = GoogleTranslator(source="en", target=gcode)
@@ -244,8 +313,8 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
         while True:                        # keep only the newest segment
             try:
                 item = tq.get_nowait()
-                with log_lock:             # attribute skipped ids
-                    log.write(f"    -> (skipped seg {item[0]})\n")
+                with log_lock:             # name the dropped seg id
+                    log.write(f"    -> (skipped seg {sid})\n")
                 sid, text = item
             except queue.Empty:
                 break
@@ -280,6 +349,13 @@ class Pipeline:
         self.streams = {}
         self.partials = {}
         self.lock = threading.Lock()   # serialize decode across streams
+        self.plock = threading.Lock()  # shared punctuator isn't mt-safe
+
+    def _punct(self, text: str) -> str:
+        if not self.punct or not text:
+            return text
+        with self.plock:
+            return self.punct.add_punctuation_with_case(text.lower())
 
     def feed(self, samples: np.ndarray, tag: str):
         stream = self.streams.get(tag)
@@ -297,8 +373,7 @@ class Pipeline:
             self.rec.reset(stream)
             self.partials.pop(tag, None)
             if text:
-                return (self.punct.add_punctuation_with_case(text.lower())
-                        if self.punct else text)
+                return self._punct(text)
         else:
             self.partials[tag] = result_text(
                 self.rec.get_result(stream)).strip()
@@ -313,12 +388,12 @@ class Pipeline:
         pad = np.zeros(int(0.75 * SR), dtype=np.float32)
         stream.accept_waveform(SR, pad)
         stream.input_finished()
-        while self.rec.is_ready(stream):
-            self.rec.decode_stream(stream)
-        text = result_text(self.rec.get_result(stream)).strip()
+        with self.lock:                  # both consumers flush at exit
+            while self.rec.is_ready(stream):
+                self.rec.decode_stream(stream)
+            text = result_text(self.rec.get_result(stream)).strip()
         self.streams.pop(tag, None)
-        return (self.punct.add_punctuation_with_case(text.lower())
-                if text and self.punct else (text or None))
+        return self._punct(text) or None
 
 
 # ------------------------------------------------------ mic -> denoise ->
@@ -366,6 +441,14 @@ class Ring:
         with self.lock:
             self.r = self.w
 
+    def reset(self, prefill: int = 0):
+        """Clear, then refill with silence — used at open and after
+        unmute so the output callback always has jitter headroom."""
+        with self.lock:
+            self.r = self.w
+        if prefill:
+            self.push(np.zeros(prefill, np.float32))
+
 
 def cable_candidates():
     """Ordered (index, sr, wasapi?) candidates for the VB-CABLE
@@ -399,10 +482,14 @@ def pick_mic():
     bad = ("cable", "vb-audio", "mapper", "primary", "stereo mix",
            "loopback")
     devs = sd.query_devices()
+    apis = sd.query_hostapis()
     ok = lambda i: devs[i]["max_input_channels"] > 0 and not any(
         b in devs[i]["name"].lower() for b in bad)
+    wasapi = lambda i: apis[devs[i]["hostapi"]]["name"] \
+        == "Windows WASAPI"          # lower latency than the MME path
     dflt = sd.default.device[0]
     cands = ([dflt] if isinstance(dflt, int) and dflt >= 0 else []) \
+        + [i for i in range(len(devs)) if wasapi(i)] \
         + list(range(len(devs)))
     return next((i for i in cands if ok(i)), None)
 
@@ -419,16 +506,36 @@ def cable_usable() -> bool:
         return False
 
 
-def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
-                 gui_q, mic_sr=SR):
+def open_cable(cands, usable, open_fn):
+    """Try cable candidates in order. open_fn(idx, sr, wasapi, ring)
+    returns a stream or raises. Never raises — returns
+    (None, None, SR) on no candidates / hidden / all-fail so the
+    captions-only path still gets a valid cable_sr."""
+    if not usable:
+        return None, None, SR
+    for idx, sr, wasapi in cands:
+        try:
+            ring = Ring(sr // 2)            # 0.5s buffer
+            ring.reset(int(0.04 * sr))      # 40ms jitter prefill
+            stream = open_fn(idx, sr, wasapi, ring)
+            diag(f"cable open: dev{idx} "
+                 f"{'wasapi+autoconv' if wasapi else 'plain'}")
+            return ring, stream, sr
+        except Exception as e:
+            diag(f"cable candidate {idx} failed: {e}")
+    return None, None, SR
+
+
+def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
+                 mic_sr=SR, cable_sr=SR):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue."""
-    needs_reset = False
-    den_fails = 0                            # consecutive denoise errors
+    rep = Reporter(gui_q)                    # dedupes; ok clears badges
+    needs_reset = muted = False
     mic_rs = Resampler(mic_sr, SR) if mic_sr != SR else None
     pend = np.empty(0, np.float32)           # native-rate accumulator
     rs = Resampler(SR, cable_sr) if ring is not None else None
     target = int(0.04 * cable_sr)            # ~40ms target ring fill
-    stat_t, stat_n, stat_ms = time.time(), 0, 0.0
+    stat_t, stat_dn, stat_ms = time.time(), 0, 0.0
     while not stop.is_set():
         try:
             x = mic_q.get(timeout=0.02)
@@ -442,51 +549,55 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
                        pend[den.frame_shift_in_samples:])
         try:
             if mute.is_set():                # hard mute: nothing leaves
-                needs_reset = True
+                needs_reset = muted = True
                 if ring is not None:
                     ring.clear()             # drain buffered voice too
                 continue
+            if muted:                        # unmute: refill the jitter
+                muted = False                # buffer or the first
+                if ring is not None:         # bursts underrun
+                    ring.reset(target)
             if den_off.is_set():             # passthrough without denoise
                 y = np.ascontiguousarray(x, np.float32)
                 needs_reset = True
+                rep.set("denoise", "ok")
             else:
-                if needs_reset:              # resync denoiser frame state
-                    den.reset()
-                    needs_reset = False
                 t0 = time.monotonic()
                 try:
+                    if needs_reset:          # resync denoiser frame
+                        den.reset()          # state; a reset failure
+                        needs_reset = False  # must not drop the chunk
                     out = den.run(np.ascontiguousarray(x, np.float32), SR)
                     stat_ms += (time.monotonic() - t0) * 1000
+                    stat_dn += 1
                     y = np.asarray(out.samples, dtype=np.float32)
-                    den_fails = 0
+                    rep.set("denoise", "ok")
                 except Exception as e:       # fail open: raw chunk out
-                    den_fails += 1
                     y = np.ascontiguousarray(x, np.float32)
                     needs_reset = True
-                    if den_fails == 1 or den_fails in (50, 200):
-                        put_drop(gui_q, ("state", "denoise", "err",
-                                         f"bypassed: {e}"))
+                    rep.set("denoise", "err", "bypassed: raw audio")
+                    diag(f"denoise fail: {e}")
             if not len(y):
                 continue
             if ring is not None:
                 fill = ring.fill()
-                rs.steer(fill - target)      # hold ~40ms jitter buffer
+                rs.steer(fill - target, cable_sr)  # ~40ms jitter buffer
                 ring.push(rs.resample(y))
             put_drop(micasr_q, y)
-            stat_n += 1
+            rep.set("mic", "ok")
             if time.time() - stat_t > 5:
                 fill = ring.fill() if ring else 0
-                if rs is not None and abs(
-                        rs.step - rs.base_step) / rs.base_step > 0.0009 \
-                        and not getattr(rs, "_sat", False):
-                    rs._sat = True
-                    put_drop(gui_q, ("state", "cable", "err", "clock skew saturating"))
+                if rs is not None:
+                    if abs(rs.step - rs.base_step) / rs.base_step > 0.0009:
+                        rep.set("cable", "err", "clock skew saturating")
+                    else:
+                        rep.set("cable", "ok")
                 diag(f"stat ring={fill} mic_q={mic_q.qsize()} "
                      f"micasr={micasr_q.qsize()} "
-                     f"denoise={stat_ms/max(stat_n,1):.1f}ms")
-                stat_t, stat_n, stat_ms = time.time(), 0, 0.0
+                     f"denoise={stat_ms/max(stat_dn,1):.1f}ms")
+                stat_t, stat_dn, stat_ms = time.time(), 0, 0.0
         except Exception as e:
-            put_drop(gui_q, ("state", "mic", "err", f"mic engine error: {e}"))
+            rep.set("mic", "err", f"mic engine error: {e}")
 
 
 # -------------------------------------------------------- speaker -> [them]
@@ -504,8 +615,9 @@ def loopback_pump(qs, gui_q):
         com_init = True
         warnings.filterwarnings("ignore", "data discontinuity")
 
-        speaker_id, rec_ctx, rec = None, None, None
-        backoff, last_check, notified = 1.0, 0.0, False
+        rep = Reporter(gui_q)      # record() synthesizes zeros on a
+        speaker_id, rec_ctx, rec = None, None, None   # silent device,
+        backoff, last_check = 1.0, 0.0   # so this recheck always runs
 
         def close_rec():
             nonlocal rec_ctx, rec
@@ -525,7 +637,7 @@ def loopback_pump(qs, gui_q):
                     if sp.id != speaker_id:
                         if speaker_id is not None:
                             diag(f"speaker changed -> {sp.name}")
-                            put_drop(gui_q, ("state", "speaker", "warn", "reconnecting"))
+                            rep.set("speaker", "warn", "reconnecting")
                         speaker_id = sp.id
                         close_rec()
                 if rec is None:
@@ -533,25 +645,19 @@ def loopback_pump(qs, gui_q):
                         include_loopback=True)
                         if m.isloopback and m.id == speaker_id), None)
                     if mic is None:
-                        if not notified:
-                            put_drop(gui_q, ("state", "speaker", "err", "no loopback device"))
-                            notified = True
+                        rep.set("speaker", "err", "no loopback device")
                         time.sleep(backoff)
                         backoff = min(backoff * 2, 5)
                         continue
                     rec_ctx = mic.recorder(samplerate=SR, channels=1)
                     rec = rec_ctx.__enter__()
                     backoff = 1.0
-                    if notified:
-                        put_drop(gui_q, ("state", "speaker", "ok", "recovered"))
-                        notified = False
+                    rep.set("speaker", "ok")
                     diag("speaker capture ok")
                 put_drop(qs, rec.record(512)[:, 0])
             except Exception as e:
                 close_rec()
-                if not notified:
-                    put_drop(gui_q, ("state", "speaker", "err", f"capture failed: {e}"))
-                    notified = True
+                rep.set("speaker", "err", f"capture failed: {e}")
                 diag(f"loopback error: {e}; retry in {backoff:.0f}s")
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 5)
@@ -568,24 +674,45 @@ def loopback_pump(qs, gui_q):
 
 # ------------------------------------------------------------- asr consumer
 
-def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None):
+def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
+                 idle_gap=1.0):
     """One stream, one consumer thread — mic can't starve behind
     speaker decode on CPU-only boxes. tag: 'spk' or 'mic'."""
+    rep = Reporter(gui_q)
     last_p = {}
     stat_a = stat_d = 0.0                  # audio seconds, decode seconds
     stat_t = last_chunk = time.time()
     trans_seq = [0]
+    who = "them" if tag == "spk" else "you"
+
+    def emit(final):
+        """One final, one fate: transcript log (with seg id so the
+        translation lines match), translate, GUI, dedup reset."""
+        seg = ""
+        if trans_q is not None:
+            trans_seq[0] += 1
+            put_drop(trans_q, (trans_seq[0], final))
+            seg = f"  [seg {trans_seq[0]}]"
+        with log_lock:
+            log.write(f"[{time.strftime('%H:%M:%S')}] "
+                      f"[{who}] {final}{seg}\n")
+        put_drop(gui_q, ("final", tag, final))
+        last_p.pop(tag, None)              # reset dedup for next utterance
+
     while not stop.is_set():
         try:
             chunk = q.get(timeout=0.02)
             last_chunk = time.time()
         except queue.Empty:
             # loopback may stop delivering on silence — feed zeros so
-            # the endpoint rule still finalizes the utterance
+            # the endpoint rule still finalizes the utterance; the
+            # returned final must be emitted, not dropped
             if pipe.partials.get(tag) \
-                    and time.time() - last_chunk > 1.0:
+                    and time.time() - last_chunk > idle_gap:
                 try:
-                    pipe.feed(np.zeros(1024, np.float32), tag)
+                    final = pipe.feed(np.zeros(1024, np.float32), tag)
+                    if final:
+                        emit(final)
                 except Exception:
                     pass
             continue
@@ -598,19 +725,13 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None):
             final = pipe.feed(chunk, tag)
             stat_a += len(chunk) / SR
             stat_d += time.monotonic() - t0
+            rep.set(f"asr-{tag}", "ok")
             if time.time() - stat_t > 5:
                 diag(f"stat decode {tag}:rtf="
                      f"{stat_d/max(stat_a,0.01):.2f} q={q.qsize()}")
                 stat_t, stat_a, stat_d = time.time(), 0.0, 0.0
             if final:
-                with log_lock:
-                    log.write(f"[{time.strftime('%H:%M:%S')}] "
-                              f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
-                if trans_q is not None:
-                    trans_seq[0] += 1
-                    put_drop(trans_q, (trans_seq[0], final))
-                put_drop(gui_q, ("final", tag, final))
-                last_p.pop(tag, None)      # reset dedup for next utterance
+                emit(final)
             elif pipe.partials.get(tag):
                 p = pipe.partials[tag]
                 # raw zipformer partials are ALL-CAPS — sentence-case
@@ -621,13 +742,10 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None):
                     last_p[tag] = p
                     put_drop(gui_q, ("partial", tag, p))
         except Exception as e:
-            put_drop(gui_q, ("state", f"asr-{tag}", "err", f"decode err: {e}"))
+            rep.set(f"asr-{tag}", "err", f"decode err: {e}")
     final = pipe.flush(tag)                # emit the last utterance
     if final:
-        with log_lock:
-            log.write(f"[{time.strftime('%H:%M:%S')}] "
-                      f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
-        put_drop(gui_q, ("final", tag, final))
+        emit(final)
 
 
 # ------------------------------------------------------------------ overlay
@@ -659,11 +777,15 @@ class Overlay:
         except Exception:
             pass
         r = self.root = tk.Tk()
+        # fonts scale with DPI automatically; pixel constants don't —
+        # scale them by the same factor (1.0 at 96 DPI)
+        self.dpi = r.winfo_fpixels("1i") / 96
         r.overrideredirect(True)
         r.attributes("-topmost", True, "-alpha", self.alpha)
         r.configure(bg=BG)
         geo = self._load_geo()
-        w, h = geo.get("w", 560), geo.get("h", 100)
+        w, h = geo.get("w", int(560 * self.dpi)), \
+            geo.get("h", int(100 * self.dpi))
         x = geo.get("x", (r.winfo_screenwidth() - w) // 2)
         y = geo.get("y", r.winfo_screenheight() - h - 90)
         # clamp into the virtual screen (all monitors, incl. negative
@@ -679,32 +801,37 @@ class Overlay:
         x = min(max(x, vx), vx + vw - w)
         y = min(max(y, vy), vy + vh - h)
         r.geometry(f"{w}x{h}+{x}+{y}")
+        pad = int(24 * self.dpi)
         mk = lambda **kw: tk.Label(r, bg=BG, anchor="w", justify="left",
-                                   wraplength=w - 24, **kw)
+                                   wraplength=w - pad, **kw)
 
         top = tk.Frame(r, bg=BG)
         top.pack(fill="x", pady=(0, 2))
-        self.badges = tk.Frame(top, bg=BG)
-        self.badges.pack(side="left", padx=(10, 4))
-        self.dot = tk.Label(self.badges, text="●", fg="#16a34a",
-                            bg=BG, font=("Segoe UI", 10))
-        self.dot.pack(side="left", padx=(0, 6))
-        self.state_lbls, self.state_lvl = {}, {}
-        for comp, lvl, txt in status_items:
-            self._set_state(comp, lvl, txt)
+        # buttons pack first so a wide badge row can never clip them
         if self.mic_active:
             self.mute_lbl = self._btn(top, "mic: on", self.tgl_mute)
             self.den_lbl = self._btn(top, "denoise: on", self.tgl_den)
         self._btn(top, "copy all", self.copy_all)
         self._btn(top, "copy", self.copy_last)
         self._btn(top, "×", self.close)
+        self.badges = tk.Frame(top, bg=BG)
+        self.badges.pack(side="left", padx=(10, 4), fill="x",
+                         expand=True)
+        self.dot = tk.Label(self.badges, text="●", fg="#16a34a",
+                            bg=BG, font=("Segoe UI", 10))
+        self.dot.pack(side="left", padx=(0, 6))
+        self.state_lbls, self.state_lvl, self.state_txt = {}, {}, {}
+        self.info_lbl = None
+        for comp, lvl, txt in status_items:
+            self._set_state(comp, lvl, txt)
 
+        self.esc_lbl = mk(fg="#fbbf24", font=("Segoe UI", 9))
         self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
         self.trans = mk(fg=ACC, font=("Segoe UI", self.fs - 3))
         self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
-        self.text_lbls = (self.them_last, self.trans, self.them_now,
-                          self.me_now)
+        self.text_lbls = (self.esc_lbl, self.them_last, self.trans,
+                          self.them_now, self.me_now)
         for lbl in self.text_lbls:
             lbl.pack(fill="x", padx=12)
         grip = mk(fg=MUTE, font=("Segoe UI", 8), text="◢",
@@ -747,28 +874,42 @@ class Overlay:
     _ORDER = {"err": 3, "warn": 2, "ok": 1, "info": 0}
 
     def _set_state(self, comp, lvl, text=""):
-        """Typed per-component status — updates the badge in place,
-        removes it on 'ok' with no text, dot shows worst level."""
+        """Typed per-component status — only warn/err get badges (the
+        rest folds into the dot), info items share one compact chip,
+        dot shows worst level."""
         self.state_lvl[comp] = lvl
+        self.state_txt[comp] = text
         lbl = self.state_lbls.get(comp)
-        if lvl == "ok" and not text:
-            if lbl is not None:
-                lbl.destroy()
-                del self.state_lbls[comp]
-        else:
-            icon = {"ok": "✓", "warn": "⚠", "err": "✗",
-                    "info": "•"}.get(lvl, "•")
-            txt = text or icon
+        if badge_shown(lvl):
+            icon = "⚠" if lvl == "warn" else "✗"
+            txt = (text or icon)[:40]
             if not txt.startswith(icon):
                 txt = f"{icon} {txt}"
             if lbl is None:
                 lbl = tk.Label(self.badges, text=txt, fg="#e5e7eb",
-                               bg=self.LVLCOL.get(lvl, "#243244"),
+                               bg=self.LVLCOL[lvl],
                                font=("Segoe UI", 8), padx=8, pady=2)
                 lbl.pack(side="left", padx=(0, 4))
                 self.state_lbls[comp] = lbl
             else:
-                lbl.config(text=txt, bg=self.LVLCOL.get(lvl, "#243244"))
+                lbl.config(text=txt, bg=self.LVLCOL[lvl])
+        elif lbl is not None:
+            lbl.destroy()
+            del self.state_lbls[comp]
+        chip = " · ".join(t for c, t in self.state_txt.items()
+                         if self.state_lvl.get(c) == "info" and t)
+        if chip:
+            if self.info_lbl is None:
+                self.info_lbl = tk.Label(
+                    self.badges, text=chip, fg="#e5e7eb",
+                    bg=self.LVLCOL["info"], font=("Segoe UI", 8),
+                    padx=8, pady=2)
+                self.info_lbl.pack(side="left", padx=(0, 4))
+            else:
+                self.info_lbl.config(text=chip)
+        elif self.info_lbl is not None:
+            self.info_lbl.destroy()
+            self.info_lbl = None
         worst = max(self.state_lvl.values(), key=self._ORDER.get,
                     default="ok")
         self.dot.config(fg=self.DOTCOL.get(worst, "#16a34a"))
@@ -801,11 +942,11 @@ class Overlay:
         self._rw, self._rh = self.root.winfo_width(), self.root.winfo_height()
 
     def _rs_move(self, e):
-        w = max(360, self._rw + e.x_root - self._rx)
-        h = max(60, self._rh + e.y_root - self._ry)
+        w = max(int(360 * self.dpi), self._rw + e.x_root - self._rx)
+        h = max(int(60 * self.dpi), self._rh + e.y_root - self._ry)
         self.root.geometry(f"{w}x{h}")
         for lbl in self.text_lbls:
-            lbl.config(wraplength=w - 24)
+            lbl.config(wraplength=w - int(24 * self.dpi))
 
     def _wheel(self, e):
         if e.state & 0x4:                        # ctrl+wheel: font size
@@ -826,12 +967,15 @@ class Overlay:
             self.close()
             return
         self._esc_armed = now + 2.5
-        self.them_now.config(text="press Esc again to quit")
+        self.esc_lbl.config(text="press Esc again to quit")
         self.root.after(2600, self._esc_clear)
 
     def _esc_clear(self):
         if getattr(self, "_esc_armed", 0) <= time.time():
-            self.them_now.config(text=self.them.get("now", ""))
+            try:                           # window may already be gone
+                self.esc_lbl.config(text="")
+            except Exception:
+                pass
 
     def tgl_mute(self):
         if not self.mic_active:
@@ -841,7 +985,7 @@ class Overlay:
         if self.mic_active:
             self.mute_lbl.config(text="mic: on" if on else "mic: muted")
         if not on:
-            self._set_state("mute", "warn", "MIC MUTED")
+            self._set_state("mute", "err", "MIC MUTED")
         else:
             self._set_state("mute", "ok")
 
@@ -897,11 +1041,11 @@ class Overlay:
                 elif ev[0] == "trans":
                     self.tr = ev[1]
                 elif ev[0] == "state":
-                    self.them["now"] = ev[3] if len(ev) > 3 else ""
+                    # badge/dot only — never overwrite the caption
                     self._set_state(ev[1], ev[2],
                                     ev[3] if len(ev) > 3 else "")
                 elif ev[0] == "err":
-                    self.them["now"] = ev[1]
+                    self.them["now"] = str(ev[1])
                     self._set_state("worker", "err", str(ev[1])[:40])
         except queue.Empty:
             pass
@@ -913,13 +1057,15 @@ class Overlay:
             self.them_now.config(text=self.them["now"] or zwsp)
             self.trans.config(text=self.tr or zwsp)
             self.me_now.config(text=self.me or zwsp)
-            # grow the window to fit wrapped text (never auto-shrinks)
+            # grow to fit wrapped text (never auto-shrinks) — anchored
+            # at the bottom edge so growth can't leave the screen
             self.root.update_idletasks()
             rh = self.root.winfo_reqheight()
-            if rh > self.root.winfo_height() + 2:
+            h0 = self.root.winfo_height()
+            if rh > h0 + 2:
                 self.root.geometry(f"{self.root.winfo_width()}x{rh}"
                                    f"+{self.root.winfo_x()}"
-                                   f"+{self.root.winfo_y()}")
+                                   f"+{self.root.winfo_y() + h0 - rh}")
 
     def close(self):
         try:
@@ -951,8 +1097,30 @@ def main():
                          "(or set LIVECAP_TRANS_EMAIL)")
     args = ap.parse_args()
 
+    # open the diag log FIRST — every earlier startup line (ASR model,
+    # provider, cable attempts) has nowhere to go in the windowed
+    # build, so it must be capturing before anything else runs
+    LOGS.mkdir(parents=True, exist_ok=True)
+    dp = LOGS / "livecap-diag.log"
+    if dp.exists() and dp.stat().st_size > 2 * 1024 * 1024:
+        dp.replace(LOGS / "livecap-diag.1.log")
+    _diag_path[0] = dp
+    _diag_size[0] = dp.stat().st_size if dp.exists() else 0
+    _diag_log[0] = open(dp, "a", encoding="utf-8", buffering=1)
+    sys.excepthook = lambda t, v, tb: diag(f"fatal: {v}")
+
+    # preflight BEFORE any sherpa call — a missing file exits the
+    # process silently from native code when the console is hidden
+    try:
+        model_dir = asr_dir()
+    except Exception:                      # incl. SystemExit and a
+        model_dir = None                   # missing models/ dir itself
+    missing = preflight(ROOT, model_dir)
+    if missing:
+        raise SystemExit("missing model files:\n  "
+                         + "\n  ".join(str(m) for m in missing))
+
     den = make_denoiser()
-    model_dir = asr_dir()
     diag(f"ASR model: {model_dir.name}")
     rec, asr_provider = make_recognizer(model_dir)
     diag(f"ASR provider: {asr_provider}")
@@ -960,7 +1128,7 @@ def main():
     pipe = Pipeline(rec, punct)
 
     status = []
-    ring = out_stream = None
+    ring, out_stream, cable_sr = None, None, SR
     cands = cable_candidates()
     if not cands:
         status.append(("cable","warn","no VB-CABLE"))
@@ -969,30 +1137,24 @@ def main():
         status.append(("cable","warn","cable hidden"))
         diag("cable not visible to apps (session) — mic capture off")
     else:
-        for cable_idx, cable_sr, wasapi in cands:
-            kw = {}
+        def _open_cable(idx, sr, wasapi, ring):
+            kw = {"latency": "low"}
             if wasapi:                    # mono on stereo shared mode
                 kw["extra_settings"] = sd.WasapiSettings(
                     auto_convert=True)
-            try:
-                ring = Ring(cable_sr // 2)  # 0.5s buffer
-                ring.push(np.zeros(int(0.04 * cable_sr),
-                                   np.float32))  # 40ms prefill
-                out_stream = sd.OutputStream(
-                    device=cable_idx, samplerate=cable_sr, channels=1,
-                    dtype="float32",
-                    callback=lambda data, frames, t, s:
-                        data.__setitem__((slice(None), 0),
-                                        ring.pull(frames)), **kw)
-                status.append(("cable","ok","cable ✓"))
-                diag(f"cable open: dev{cable_idx} "
-                     f"{'wasapi+autoconv' if wasapi else 'plain'}")
-                break
-            except Exception as e:
-                ring = out_stream = None
-                diag(f"cable candidate {cable_idx} failed: {e}")
+            return sd.OutputStream(
+                device=idx, samplerate=sr, channels=1,
+                dtype="float32",
+                callback=lambda data, frames, t, s:
+                    data.__setitem__((slice(None), 0),
+                                    ring.pull(frames)), **kw)
+        ring, out_stream, cable_sr = open_cable(
+            cands, True, _open_cable)
         if out_stream is None:
             status.append(("cable","err","cable open failed"))
+        else:
+            status.append(("cable","ok","cable ✓"))
+            diag(f"cable latency: {out_stream.latency}")
 
     mic_q = queue.Queue(maxsize=10)      # voice path: <160ms, drop not delay
     micasr_q = queue.Queue(maxsize=64)   # ~1s of 16ms chunks
@@ -1001,12 +1163,6 @@ def main():
                                           # can't eat RAM
     mute, den_off = threading.Event(), threading.Event()
     log_lock = threading.Lock()
-    LOGS.mkdir(parents=True, exist_ok=True)
-    # preflight: model files must exist before sherpa — clearer than a
-    # native error when the console is hidden
-    for need in ("tokens.txt",):
-        if not (model_dir / need).exists():
-            raise SystemExit(f"missing model file: {model_dir / need}")
     # log retention: sweep transcripts older than --log-days (0 = keep)
     if getattr(args, "log_days", 0):
         cutoff = time.time() - args.log_days * 86400
@@ -1015,12 +1171,6 @@ def main():
                 f.unlink(missing_ok=True)
     log = open(LOGS / f"livecap-{time.strftime('%Y%m%d-%H%M%S')}.txt",
                "w", encoding="utf-8", buffering=1)
-    # rotate diag: >2MB -> .1, fresh file
-    dp = LOGS / "livecap-diag.log"
-    if dp.exists() and dp.stat().st_size > 2 * 1024 * 1024:
-        dp.replace(LOGS / "livecap-diag.1.log")
-    _diag_log[0] = open(dp, "a", encoding="utf-8", buffering=1)
-    sys.excepthook = lambda t, v, tb: diag(f"fatal: {v}")
     threading.excepthook = lambda a: (
         diag(f"thread {a.thread.name} died: {a.exc_value}"),
         put_drop(gui_q, ("state", "worker", "err", f"{a.thread.name} died")))
@@ -1040,6 +1190,7 @@ def main():
                 st = sd.InputStream(
                     device=mic_idx,
                     samplerate=SR, channels=1, dtype="float32",
+                    latency="low",
                     blocksize=den.frame_shift_in_samples,
                     callback=lambda d, f, t, s: put_drop(
                         mic_q, d[:, 0].copy()))
@@ -1052,6 +1203,7 @@ def main():
                 st = sd.InputStream(
                     device=mic_idx,
                     samplerate=mic_sr, channels=1, dtype="float32",
+                    latency="low",
                     blocksize=int(den.frame_shift_in_samples
                                   * mic_sr / SR),
                     callback=lambda d, f, t, s: put_drop(
@@ -1059,29 +1211,33 @@ def main():
             st.start()
             in_stream = st                 # assign only after start()
             status.append(("mic","ok","mic ✓"))
-            if mic_sr != SR:
-                diag(f"mic opened at {mic_sr}Hz, resampling to 16k")
+            diag(f"mic open: dev{mic_idx} {mic_sr}Hz "
+                 f"latency={st.latency}")
          except Exception as e:
             status.append(("mic","warn","no mic"))
             diag(f"no mic input ({e})")
     if out_stream is not None:
         out_stream.start()
     workers = []
-    for tgt, kw in (
-            (voice_engine, dict(args=(mic_q, den, ring, cable_sr,
-                                      micasr_q, mute, den_off, gui_q,
-                                      mic_sr))),
-            (loopback_pump, dict(args=(qs, gui_q))),
-            (asr_consumer, dict(args=(pipe, qs, gui_q, log, log_lock,
-                                      "spk", trans_q))),
-            (asr_consumer, dict(args=(pipe, micasr_q, gui_q, log,
-                                      log_lock, "mic")))):
-        t = threading.Thread(target=tgt, daemon=True, **kw)
+    for tgt, name, kw in (
+            (voice_engine, "voice",
+             dict(args=(mic_q, den, ring, micasr_q, mute, den_off,
+                        gui_q),
+                  kwargs=dict(mic_sr=mic_sr, cable_sr=cable_sr))),
+            (loopback_pump, "spk-pump", dict(args=(qs, gui_q))),
+            (asr_consumer, "asr-spk",
+             dict(args=(pipe, qs, gui_q, log, log_lock,
+                        "spk", trans_q))),
+            (asr_consumer, "asr-mic",
+             dict(args=(pipe, micasr_q, gui_q, log,
+                        log_lock, "mic")))):
+        t = threading.Thread(target=tgt, daemon=True, name=name, **kw)
         t.start()
         workers.append(t)
     if trans_q is not None:
         status.append(("trans","info",f"trans→{args.lang}"))
         t = threading.Thread(target=translator_worker, daemon=True,
+                             name="trans",
                              args=(trans_q, gui_q, log, log_lock,
                                    lang_code(args.lang),
                                    args.trans_email))
@@ -1098,6 +1254,8 @@ def main():
         stop.set()
         for w in workers:                # let workers flush + emit
             w.join(timeout=3)
+            if w.is_alive():
+                diag(f"shutdown: {w.name} still blocked after 3s")
         log.close()
         if out_stream is not None:
             out_stream.stop()
@@ -1107,19 +1265,25 @@ def main():
             in_stream.close()
 
 
+def _fatal_box(msg):
+    """Console may be hidden in the built exe — surface fatal startup
+    failures as a dialog, not silence."""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, msg, "livecap", 0x10)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     try:
         main()
-    except SystemExit:
+    except SystemExit as e:
+        # SystemExit(str) is our own clean startup error — the
+        # windowed build has no console, so it needs the dialog too
+        if isinstance(e.code, str):
+            _fatal_box(f"livecap failed to start:\n{e.code}")
         raise
     except Exception as e:
-        # console may be hidden in the built exe — surface fatal
-        # startup failures as a dialog, not silence
-        try:
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(
-                0, f"livecap failed to start:\n{e}",
-                "livecap", 0x10)
-        except Exception:
-            pass
+        _fatal_box(f"livecap failed to start:\n{e}")
         raise
