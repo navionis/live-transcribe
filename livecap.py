@@ -114,14 +114,12 @@ def make_recognizer(model_dir: Path):
               rule2_min_trailing_silence=1.2,
               rule3_min_utterance_length=20.0,
               decoding_method="greedy_search")
-    for cand in ("dml", "cuda", "cpu"):   # first that ORT accepts wins
-        try:
-            rec = sherpa_onnx.OnlineRecognizer.from_transducer(
-                provider=cand, **kw)
-            return rec, cand
-        except Exception:
-            continue
-    return None, "none"
+    # stock sherpa-onnx pip wheel is CPU-only — every non-"cpu" string
+    # silently falls back to CPU in provider.cc, so don't pretend to
+    # probe: report what the build actually has.
+    rec = sherpa_onnx.OnlineRecognizer.from_transducer(provider="cpu",
+                                                       **kw)
+    return rec, "cpu"
 
 
 def make_denoiser():
