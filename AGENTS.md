@@ -37,6 +37,9 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - Worker loops wrapped in try/except — a dead thread pushes
   `("err", ...)`, which becomes a persistent red badge (not just
   overwritten caption text)
+- `Reporter(q).set(comp, lvl, msg)` emits `("state", ...)` only on
+  (lvl, msg) transitions — call it every chunk; `ok` on success paths
+  clears badges the error path set
 - `_poll` reschedules FIRST, tolerates per-event exceptions
 
 ## Audio / models
@@ -53,10 +56,11 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   `Pipeline.flush()` pads 0.75s silence before `input_finished()` —
   streaming transducers drop final tokens without it
 - queue `get(timeout=0.02)` (20ms); sizes tuned to real latency:
-  mic_q=16 (~0.25s — voice path drops, never delays), qs/micasr_q=64
+  mic_q=10 (~0.16s — voice path drops, never delays), qs/micasr_q=64
   (~2s/~1s), trans_q=4, gui_q=1024; all puts via `put_drop`
   (drop-oldest) — unbounded gui_q was a real RAM leak
-- ring cleared on mute (`ring.clear()`) — buffered voice can't leak
+- ring cleared on mute (`ring.clear()`) — buffered voice can't leak;
+  `ring.reset(40ms)` refills the jitter buffer on unmute and at open
 - worker loops: per-chunk try/except — one bad chunk badges err and
   continues, thread survives
 - stats on stderr every 5s: ring fill, queue depths, denoise ms,
@@ -69,10 +73,12 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - `cable_usable()`: WASAPI-level check — "CABLE Output" must appear
   in `sc.all_microphones()` (RDP sessions hide local endpoints; the
   driver exists but apps can't see it). Fails -> mic leg skipped
-- `pick_mic()`: default input FIRST, then others — rejects
-  cable/vb-audio (self-feedback) + stereo mix/loopback (remote
-  speaker's audio would echo back as your voice); None -> `no mic`
-  badge, stream never opened
+- `pick_mic()`: default input FIRST, then WASAPI devices (lower
+  latency than MME), then others — rejects cable/vb-audio
+  (self-feedback) + stereo mix/loopback (remote speaker's audio
+  would echo back as your voice); None -> `no mic` badge, stream
+  never opened. Both streams open `latency="low"`, logged via
+  `stream.latency`
 - `sd.OutputStream`/`sd.InputStream` open failures degrade to
   captions-only, never crash; `in_stream` assigned only after
   `start()` succeeds (buttons can't show for a dead mic)
@@ -81,10 +87,13 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 
 - Frameless always-on-top tkinter; DPI-aware
   (`SetProcessDpiAwareness(2)` before Tk)
-- Top row: status badges (one per functional unit; ✓ -> green,
-  warn keywords/"err"/"died" -> red, else gray) + real tk.Button
-  controls; mic/denoise buttons and `m`/`d` hotkeys exist only when
-  `mic_active`
+- Top row: warn/err get badges (text truncated ~40 chars); `ok`
+  folds into the summary dot (worst level wins), `info` items share
+  one compact chip; real tk.Button controls pack FIRST so badges
+  can't clip them; mic/denoise buttons and `m`/`d` hotkeys exist
+  only when `mic_active`
+- `state` events never touch the caption line — only badges/dot;
+  Esc prompt lives in its own `esc_lbl`
 - MIC MUTED is a persistent red badge added/removed on toggle
 - `hidden-from-capture ✓` badge on
   `SetWindowDisplayAffinity(hwnd, 0x11)` success; `visible in
@@ -164,17 +173,16 @@ Result: `build\livecap.dist\livecap.exe`, models beside it.
 
 ## Known deferred work
 
-- resampler drift: chunk-aligned linspace fills the ring ~0.06% fast;
-  needs stateful phase carry or soxr
-- speaker-leg reconnect when the default output device changes
-- shutdown: last utterance lost on exit; no thread joins; log may
-  close while threads still write
+- shutdown: a worker blocked past its 3s join can outlive the
+  transcript log (writes land on a closed file)
 - consent defaults (translation sends others' speech out by default)
 - typed status model with summary dot (phase 2 of the UX guide)
 
 ## Verify
 
 - `.venv\Scripts\python.exe -m py_compile livecap.py`
+- `.venv\Scripts\python.exe -m unittest test_livecap` (pure logic —
+  no devices)
 - `Parser::ParseFile` for .ps1 changes before shipping
 - live: play speech -> `[them]` tracks; speak -> `you:` post-denoise
   (when cable usable); Esc x2/Ctrl+C exits clean
