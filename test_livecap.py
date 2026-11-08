@@ -588,6 +588,47 @@ class LateRingTest(unittest.TestCase):
         self.assertGreater(ring.fill(), 0)
         self.assertGreater(micasr_q.qsize(), 0)
 
+    def test_ring_swap_same_rates(self):
+        """A reopened cable brings a NEW ring object at the same
+        rates — the engine must feed it (and rebuild rs for it, so
+        the old device's skew estimate can't carry over)."""
+        mic_q, micasr_q, gui_q = (queue.Queue(), queue.Queue(),
+                                  queue.Queue())
+        mute, den_off = threading.Event(), threading.Event()
+        ring1 = livecap.Ring(livecap.SR // 2)
+        state = {"in": None, "out": None, "ring": ring1,
+                 "mic_sr": livecap.SR, "cable_sr": livecap.SR,
+                 "mic_dead": False, "cable_dead": False,
+                 "ev": threading.Event()}
+        t = threading.Thread(
+            target=livecap.voice_engine,
+            args=(mic_q, _FakeDen(), ring1, micasr_q, mute, den_off,
+                  gui_q),
+            kwargs=dict(mic_sr=livecap.SR, cable_sr=livecap.SR,
+                        state=state),
+            daemon=True)
+        t.start()
+        mic_q.put(np.zeros(256, np.float32))
+        time.sleep(0.15)
+        ring2 = livecap.Ring(livecap.SR // 2)
+        state["ring"] = ring2                # reopen @ same rates
+        for _ in range(3):
+            mic_q.put(np.zeros(256, np.float32))
+        time.sleep(0.3)
+        livecap.stop.set()
+        t.join(2)
+        livecap.stop.clear()
+        mic_errs = []
+        while True:
+            try:
+                e = gui_q.get_nowait()
+            except queue.Empty:
+                break
+            if e[0] == "state" and e[1] == "mic" and e[2] == "err":
+                mic_errs.append(e)
+        self.assertFalse(mic_errs, mic_errs)
+        self.assertGreater(ring2.fill(), 0)   # new ring is fed
+
 
 class MicStallTest(unittest.TestCase):
     """P1 — 1.5s of silence on mic_q reports an error; the next chunk

@@ -990,6 +990,7 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
     rs = Resampler(SR, cable_sr) if ring is not None else None
     target = int(0.04 * cable_sr)            # ~40ms target ring fill
     cur_sr = (mic_sr, cable_sr)
+    cur_ring = ring
     shift = den.frame_shift_in_samples
     if ring is not None:                     # drop stale startup
         ring.reset(target)                   # chunks, not play them
@@ -1001,13 +1002,19 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
         if state is not None:                # supervisor may have
             ring = state["ring"]             # swapped these on reopen
             new_sr = state["mic_sr"], state["cable_sr"]
-            # a ring appearing WITHOUT a rate change still needs rs —
-            # it was None if the cable was absent at engine start and
-            # came back at the same rate pair
-            if new_sr != cur_sr or (ring is not None and rs is None):
-                cur_sr = new_sr
-                mic_rs = Resampler(cur_sr[0], SR) \
-                    if cur_sr[0] != SR else None
+            rates_changed = new_sr != cur_sr
+            # rebuild rs on a ring OBJECT swap too, not just a rate
+            # change — a reopened cable's clock skew differs from what
+            # rs.trim learned; ring->None drops rs so the stat path
+            # never calls ring.fill() on a missing ring. mic_rs only
+            # resets on a real mic-rate change (replug drains it via
+            # the mic_t block below)
+            if rates_changed or ring is not cur_ring \
+                    or (ring is not None and rs is None):
+                if rates_changed:
+                    mic_rs = Resampler(new_sr[0], SR) \
+                        if new_sr[0] != SR else None
+                cur_sr, cur_ring = new_sr, ring
                 rs = Resampler(SR, cur_sr[1]) \
                     if ring is not None else None
                 target = int(0.04 * cur_sr[1])
