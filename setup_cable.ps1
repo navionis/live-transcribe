@@ -1,10 +1,10 @@
-# setup_cable.ps1 — one-click VB-CABLE install for livecap
+# setup_cable.ps1 - one-click VB-CABLE install for livecap
 #
 #   powershell -ExecutionPolicy Bypass -File setup_cable.ps1
 #
 # Self-elevates, downloads the driver pack, removes broken duplicate
 # cable devices, installs via pnputil (no GUI), offers to reboot.
-# After reboot, run livecap.py — status shows "cable ✓"; in your call
+# After reboot, run livecap.py - status shows "cable OK"; in your call
 # app pick "CABLE Output" as the microphone.
 
 param(
@@ -18,7 +18,7 @@ $dst = "$env:USERPROFILE\Downloads\VBCABLE"
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "needs admin — relaunching elevated..."
+    Write-Host "needs admin - relaunching elevated..."
     Start-Process powershell -Verb RunAs -ArgumentList @(
         '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"",
         $(if ($NoReboot) { '-NoReboot' } else { '' }))
@@ -54,7 +54,7 @@ if (-not (Test-Path "$dst\VBCABLE_Setup_x64.exe")) {
 
 # --- install (skip if a healthy cable already exists) ---
 if ($good -and -not $bad) {
-    Write-Host "healthy cable device already present — skipping install"
+    Write-Host "healthy cable device already present - skipping install"
 }
 else {
     $inf = Get-ChildItem $dst -Filter 'vbMmeCable64_win10.inf' -Recurse |
@@ -64,11 +64,11 @@ else {
         pnputil /add-driver $inf /install
     }
     else {
-        Write-Host "win10 inf not found — launching GUI installer"
+        Write-Host "win10 inf not found - launching GUI installer"
         Start-Process "$dst\VBCABLE_Setup_x64.exe"
     }
     Write-Host ""
-    Write-Host ">>> REBOOT required for CABLE Input/Output to appear <<<"
+    Write-Host "REBOOT required for CABLE Input/Output to appear"
 }
 
 if (-not $NoReboot -and ($bad -or -not $good)) {
