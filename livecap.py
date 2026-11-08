@@ -408,6 +408,7 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
             if trans_q is not None and tag == "spk":
                 put_drop(trans_q, final)
             put_drop(gui_q, ("final", tag, final))
+            last_p.pop(tag, None)          # reset dedup for next utterance
         elif pipe.partials.get(tag):
             p = pipe.partials[tag]
             # raw zipformer partials are ALL-CAPS — sentence-case them for
@@ -448,9 +449,18 @@ class Overlay:
         w, h = geo.get("w", 560), geo.get("h", 100)
         x = geo.get("x", (r.winfo_screenwidth() - w) // 2)
         y = geo.get("y", r.winfo_screenheight() - h - 90)
-        # clamp into the visible screen — saved geometry can land off-screen
-        x = min(max(x, 0), max(0, r.winfo_screenwidth() - w))
-        y = min(max(y, 0), max(0, r.winfo_screenheight() - h))
+        # clamp into the virtual screen (all monitors, incl. negative
+        # coords left/above primary) — saved geometry can be off-screen
+        try:
+            import ctypes
+            u = ctypes.windll.user32
+            vx, vy = u.GetSystemMetrics(76), u.GetSystemMetrics(77)
+            vw, vh = u.GetSystemMetrics(78), u.GetSystemMetrics(79)
+        except Exception:
+            vx = vy = 0
+            vw, vh = r.winfo_screenwidth(), r.winfo_screenheight()
+        x = min(max(x, vx), vx + vw - w)
+        y = min(max(y, vy), vy + vh - h)
         r.geometry(f"{w}x{h}+{x}+{y}")
         mk = lambda **kw: tk.Label(r, bg=BG, anchor="w", justify="left",
                                    wraplength=w - 24, **kw)
@@ -505,11 +515,11 @@ class Overlay:
             self._badge("hidden-from-capture ✓")
         r.after(30, self._poll)
 
-    def _badge(self, text):
-        ok = "✓" in text
-        warn = not ok and any(k in text for k in
+    def _badge(self, text, warn=False):
+        ok = "✓" in text and not warn
+        warn = warn or (not ok and any(k in text for k in
                               ("no ", "failed", "hidden", "off", "paused",
-                               "unavailable"))
+                               "unavailable", "died", "err")))
         bg = "#14532d" if ok else "#7f1d1d" if warn else "#243244"
         tk.Label(self.badges, text=text, fg="#e5e7eb",
                  bg=bg, font=("Segoe UI", 8), padx=8, pady=2
@@ -563,12 +573,16 @@ class Overlay:
             self.root.attributes("-alpha", self.alpha)
 
     def tgl_mute(self):
+        if not self.mic_active:
+            return
         on = self.mute.is_set()                  # muted now? -> unmute
         (self.mute.clear if on else self.mute.set)()
         if self.mic_active:
             self.mute_lbl.config(text="mic: on" if on else "mic: muted")
 
     def tgl_den(self):
+        if not self.mic_active:
+            return
         on = self.den_off.is_set()               # denoise off? -> on
         (self.den_off.clear if on else self.den_off.set)()
         if self.mic_active:
@@ -619,6 +633,7 @@ class Overlay:
                     self.tr = ev[1]
                 elif ev[0] == "err":
                     self.them["now"] = ev[1]
+                    self._badge(f"err: {ev[1]}", warn=True)
         except queue.Empty:
             pass
         except Exception:                    # one bad event must not
@@ -713,15 +728,19 @@ def main():
     if out_stream is None:
         status.append("mic off")
     else:
-        try:
+        mic_idx = pick_mic()
+        if mic_idx is None:
+            status.append("no mic")      # no safe input — don't open
+        else:
+         try:
             in_stream = sd.InputStream(
-                device=pick_mic(),
+                device=mic_idx,
                 samplerate=SR, channels=1, dtype="float32",
                 blocksize=den.frame_shift_in_samples,
                 callback=lambda d, f, t, s: put_drop(mic_q, d[:, 0].copy()))
             in_stream.start()
             status.append("mic ✓")
-        except Exception as e:
+         except Exception as e:
             status.append("no mic")
             print(f"no mic input ({e})", file=sys.stderr)
     if out_stream is not None:
