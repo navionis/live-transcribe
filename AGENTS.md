@@ -27,7 +27,9 @@ Zero-arg Krisp-style app. Run: `.venv\Scripts\python.exe livecap.py`
 ```
 PortAudio cb (RT)    mic -> mic_q -> voice_engine: GTCRN
                          |-> Ring -> PortAudio out cb -> CABLE Input
-                         |-> micasr_q (drop-oldest, lowest priority)
+                         |-> micasr_q RAW chunk (drop-oldest, lowest
+                             priority) — [you] captions skip denoise:
+                             GTCRN can eat consonants
 soundcard pump     loopback -> qs (highest priority)
 asr_consumer x2    one thread per stream (spk + mic) -> decode -> gui_q
 translator_worker  trans_q -> Google -> MyMemory fallback -> gui_q
@@ -125,7 +127,11 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 
 ## Overlay
 
-- Frameless always-on-top tkinter; DPI-aware
+- Frameless always-on-top tkinter; OS-NATIVE drag/resize —
+  `SendMessageW(WM_NCLBUTTONDOWN, HTCAPTION/HTBOTTOMRIGHT)` moves
+  the window in Windows' own modal loop (zero Python per mouse
+  event) so GIL-saturating workers can't freeze a drag; wraplength
+  and min-size are maintained via `<Configure>`; DPI-aware
   (`SetProcessDpiAwareness(1)` system-aware before Tk — Tk 8.6 can't
   track per-monitor anyway)
 - Top row: at most ONE badge (err before warn, ~40 chars + `+N`
