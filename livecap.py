@@ -783,11 +783,11 @@ def dead_cb(state, comp, rep, msg):
     return cb
 
 
-def _sd_reinit(state, rep):
+def _sd_reinit(state, rep, comp):
     """PortAudio's device list is frozen at Pa_Initialize — only
     reinit when nothing is streaming, else warn."""
     if state.get("in") is not None or state.get("out") is not None:
-        rep.set("mic", "warn", "restart to detect new devices")
+        rep.set(comp, "warn", "restart to detect new devices")
         return False
     try:
         sd._terminate()
@@ -840,22 +840,24 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
         ev.clear()
         now = time.time()
         if state["mic_dead"] and now >= next_try["mic"]:
+            old = state["in"]
+            if old is not None:                # drop the dead stream
+                state["in"] = None             # NOW — its stale device
+                try:                           # index blocks _sd_reinit
+                    old.stop(); old.close()    # and replug detection
+                except Exception:
+                    pass
             try:
                 idx = pick_fn()
-                if idx is None and _sd_reinit(state, rep):
+                if idx is None and _sd_reinit(state, rep, "mic"):
                     idx = pick_fn()    # re-enumerate for replugs
                 if idx is None:
                     raise RuntimeError("no mic")
                 st, msr = open_mic_fn(idx)
                 st.start()
-                old, state["in"] = state["in"], st
+                state["in"] = st
                 state["mic_sr"], state["mic_dead"] = msr, False
                 state["mic_t"] = time.time()   # grace before stall
-                try:
-                    if old is not None:
-                        old.stop(); old.close()
-                except Exception:
-                    pass
                 backoff["mic"] = base
                 fails["mic"] = 0
                 rep.set("mic", "ok")
@@ -863,27 +865,29 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
             except Exception as e:
                 fails["mic"] += 1
                 if fails["mic"] >= 3:
-                    _sd_reinit(state, rep)
+                    _sd_reinit(state, rep, "mic")
                 next_try["mic"] = now + backoff["mic"]
                 if _should_log_fail(fails["mic"]):
                     diag(f"mic reopen failed ({e}); "
                          f"retry in {backoff['mic']:.0f}s")
                 backoff["mic"] = min(backoff["mic"] * 2, 5 * base)
         if state["cable_dead"] and now >= next_try["cable"]:
+            old = state["out"]
+            if old is not None:                # drop the dead stream
+                state["out"], state["ring"] = None, None   # NOW — a
+                try:                           # stale object blocks
+                    old.stop(); old.close()    # _sd_reinit; the engine
+                except Exception:              # skips a None ring and
+                    pass                       # rebuilds rs on reopen
             try:
                 ring2, st2, csr = open_cable_fn()
                 if st2 is None:
                     raise RuntimeError("all cable candidates failed")
                 st2.start()
-                old, state["out"] = state["out"], st2
+                state["out"] = st2
                 state["ring"], state["cable_sr"] = ring2, csr
                 state["cable_dead"] = False
                 state["cable_t"] = time.time()
-                try:
-                    if old is not None:
-                        old.stop(); old.close()
-                except Exception:
-                    pass
                 backoff["cable"] = base
                 fails["cable"] = 0
                 rep.set("cable", "ok")
@@ -891,7 +895,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
             except Exception as e:
                 fails["cable"] += 1
                 if fails["cable"] >= 3:
-                    _sd_reinit(state, rep)
+                    _sd_reinit(state, rep, "cable")
                 next_try["cable"] = now + backoff["cable"]
                 if _should_log_fail(fails["cable"]):
                     diag(f"cable reopen failed ({e}); "
@@ -1117,6 +1121,56 @@ def loopback_pump(qs, gui_q):
             pass
         if com_init:
             ctypes.windll.ole32.CoUninitialize()
+
+
+# ----------------------------------------------------------------- hotkeys
+
+def hotkey_worker(gui_q, tid_out=None):
+    """Global hotkeys — tk bind() only fires while the overlay has
+    focus, which mid-call it never does. RegisterHotKey(NULL hwnd)
+    posts WM_HOTKEY to THIS thread's queue; a GetMessage loop drains
+    it and pushes ("hotkey", action) into gui_q for _poll. Any
+    failure is a badge + diag, never fatal."""
+    WM_HOTKEY = 0x0312
+    CTRL_ALT_NOREPEAT = 0x0002 | 0x0001 | 0x4000   # MOD_CONTROL |
+    # MOD_ALT | MOD_NOREPEAT — held key can't toggle repeatedly.
+    # Ctrl+Alt avoids call apps' own mute chords (Meet Ctrl+D,
+    # Teams/Discord Ctrl+Shift+M, Zoom Alt+A).
+    # id -> (action, key letter, modifiers, vk)
+    HK = {1: ("mute", "m", CTRL_ALT_NOREPEAT, ord("M")),
+          2: ("den",  "d", CTRL_ALT_NOREPEAT, ord("D"))}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        if tid_out is not None:
+            tid_out.append(
+                ctypes.windll.kernel32.GetCurrentThreadId())
+        registered = []
+        for hkid, (act, letter, mod, vk) in HK.items():
+            if u.RegisterHotKey(None, hkid, mod, vk):
+                registered.append(hkid)
+            else:
+                put_drop(gui_q, ("state", "hotkey", "warn",
+                                 f"ctrl+alt+{letter} taken"))
+                diag(f"hotkey {act} reg failed: "
+                     f"err {ctypes.get_last_error()}")
+        if not registered:
+            return
+        diag("hotkeys registered: "
+             + ", ".join(HK[i][0] for i in registered))
+        try:
+            msg = wintypes.MSG()
+            while u.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == WM_HOTKEY:
+                    hk = HK.get(msg.wParam)
+                    if hk:
+                        put_drop(gui_q, ("hotkey", hk[0]))
+        finally:
+            for hkid in registered:
+                u.UnregisterHotKey(None, hkid)
+    except Exception as e:
+        diag(f"hotkey worker failed: {e}")
 
 
 # ------------------------------------------------------------- asr consumer
@@ -1500,6 +1554,11 @@ class Overlay:
                         self.me = "you: " + text
                 elif ev[0] == "trans":
                     self.tr = ev[1]
+                elif ev[0] == "hotkey":
+                    if ev[1] == "mute":
+                        self.tgl_mute()
+                    elif ev[1] == "den":
+                        self.tgl_den()
                 elif ev[0] == "state":
                     # badge/dot only — never overwrite the caption
                     self._set_state(ev[1], ev[2],
@@ -1708,7 +1767,8 @@ def main():
             status.append(("cable","err","start failed"))
     workers = []
     worker_defs = []
-    # engine runs even when the mic/cable failed at startup — its
+    hk_tid = []                    # hotkey worker's thread id — the
+                                   # WM_QUIT post at shutdown needs it
     # stall detector is what flags them dead and the supervisor is
     # what brings them back; the engine picks up new ring/rates from
     # `state` per chunk
@@ -1729,6 +1789,8 @@ def main():
             (asr_consumer, "asr-mic",
              dict(args=(pipe, micasr_q, gui_q, log,
                         log_lock, "mic"))),
+            (hotkey_worker, "hotkey",
+             dict(args=(gui_q,), kwargs=dict(tid_out=hk_tid))),
     ]
     for tgt, name, kw in worker_defs:
         t = threading.Thread(target=tgt, daemon=True, name=name, **kw)
@@ -1754,6 +1816,13 @@ def main():
         Overlay(gui_q, status, mute, den_off, mic_active=True).run()
     finally:
         stop.set()
+        try:
+            import ctypes
+            if hk_tid:                   # wake the hotkey thread's
+                ctypes.windll.user32.PostThreadMessageW(  # GetMessage
+                    hk_tid[0], 0x0012, 0, 0)   # WM_QUIT — it unregisters
+        except Exception:                # + joins; daemon dies anyway
+            pass
         for w in workers:                # let workers flush + emit
             w.join(timeout=3)
             if w.is_alive():
