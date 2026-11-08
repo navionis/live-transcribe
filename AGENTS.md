@@ -45,7 +45,10 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 ## Audio / models
 
 - 16kHz mono float32 internally; cable playback resampled to the
-  cable's native rate via `resample_linear` (44.1k on this machine)
+  cable's native rate via the stateful `Resampler` (phase carry +
+  ceil n_out so phase stays >= 0 — a floor left it negative at
+  step>1 and read future samples); `steer()` closed-loops the rate
+  toward a 40ms ring fill (5ms deadband, +-0.1% cap)
 - `num_threads = os.cpu_count()` on ASR, denoiser, punct
 - ASR provider probed per startup: `dml -> cuda -> cpu`, printed as
   `ASR provider: ...`; machine runs `dml`
@@ -63,7 +66,8 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   `ring.reset(40ms)` refills the jitter buffer on unmute and at open
 - worker loops: per-chunk try/except — one bad chunk badges err and
   continues, thread survives
-- stats on stderr every 5s: ring fill, queue depths, denoise ms,
+- stats on stderr every 5s: ring fill + under/over counts, queue
+  depths + drops, denoise avg/max/slow-frame ms + fail count,
   per-stream decode RTF (`stat decode spk:rtf=...`)
 
 ## Devices
@@ -73,12 +77,14 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - `cable_usable()`: WASAPI-level check — "CABLE Output" must appear
   in `sc.all_microphones()` (RDP sessions hide local endpoints; the
   driver exists but apps can't see it). Fails -> mic leg skipped
-- `pick_mic()`: default input FIRST, then WASAPI devices (lower
-  latency than MME), then others — rejects cable/vb-audio
+- `pick_mic()`: WASAPI host-API default input FIRST (PortAudio's
+  global default is MME — tens of ms worse), then sd.default, then
+  WASAPI devices, then others — rejects cable/vb-audio
   (self-feedback) + stereo mix/loopback (remote speaker's audio
   would echo back as your voice); None -> `no mic` badge, stream
-  never opened. Both streams open `latency="low"`, logged via
-  `stream.latency`
+  never opened. WASAPI mics open with `auto_convert` so Windows
+  does the SRC (keeps the resampler out of the mic path). Both
+  streams open `latency="low"`, logged via `stream.latency`
 - `sd.OutputStream`/`sd.InputStream` open failures degrade to
   captions-only, never crash; `in_stream` assigned only after
   `start()` succeeds (buttons can't show for a dead mic)
@@ -87,11 +93,12 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 
 - Frameless always-on-top tkinter; DPI-aware
   (`SetProcessDpiAwareness(2)` before Tk)
-- Top row: warn/err get badges (text truncated ~40 chars); `ok`
-  folds into the summary dot (worst level wins), `info` items share
-  one compact chip; real tk.Button controls pack FIRST so badges
-  can't clip them; mic/denoise buttons and `m`/`d` hotkeys exist
-  only when `mic_active`
+- Top row: at most ONE badge (err before warn, ~40 chars + `+N`
+  for hidden extras) via `plan_badges`; `ok` folds into the summary
+  dot (worst level wins), `info` items share one compact chip that
+  hides while any err shows; real tk.Button controls pack FIRST so
+  badges can't clip them; mic/denoise buttons and `m`/`d` hotkeys
+  exist only when `mic_active`
 - `state` events never touch the caption line — only badges/dot;
   Esc prompt lives in its own `esc_lbl`
 - MIC MUTED is a persistent red badge added/removed on toggle
