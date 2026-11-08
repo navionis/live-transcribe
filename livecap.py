@@ -776,7 +776,7 @@ def main():
                                           # can't eat RAM
     mute, den_off = threading.Event(), threading.Event()
     log_lock = threading.Lock()
-    LOGS.mkdir(exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
     log = open(LOGS / f"livecap-{time.strftime('%Y%m%d-%H%M%S')}.txt",
                "w", encoding="utf-8", buffering=1)
     trans_q = queue.Queue(maxsize=4) if args.lang else None
