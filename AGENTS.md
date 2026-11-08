@@ -63,7 +63,13 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   (~2s/~1s), trans_q=4, gui_q=1024; all puts via `put_drop`
   (drop-oldest) — unbounded gui_q was a real RAM leak
 - ring cleared on mute (`ring.clear()`) — buffered voice can't leak;
-  `ring.reset(40ms)` refills the jitter buffer on unmute and at open
+  `ring.reset(40ms)` refills the jitter buffer on unmute and at open;
+  `ring.drop_to(target)` hard-skips a latency burst (>target+60ms)
+- single-instance: named mutex `Local\livecap-singleton` first thing
+  in `main`; `loading_splash()` shows during model load
+- `stream_supervisor` reopens dead mic/cable streams (finished_callback
+  or stall -> `mark_dead` -> backoff 1/2/5s) — engine picks up new
+  ring/rates from the shared `state` dict each chunk
 - worker loops: per-chunk try/except — one bad chunk badges err and
   continues, thread survives
 - stats on stderr every 5s: ring fill + under/over counts, queue

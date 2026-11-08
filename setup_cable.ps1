@@ -52,6 +52,16 @@ if (-not (Test-Path "$dst\VBCABLE_Setup_x64.exe")) {
     Remove-Item $zip
 }
 
+# --- verify Authenticode before installing a driver as admin ---
+$unsigned = Get-ChildItem $dst -Recurse -Include *.cat,*.sys,*.exe |
+    Where-Object {
+        (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
+if ($unsigned) {
+    Write-Host "ERROR: unsigned or corrupt files in driver pack:"
+    $unsigned | ForEach-Object { Write-Host "  $($_.FullName)" }
+    exit 1
+}
+
 # --- install (skip if a healthy cable already exists) ---
 if ($good -and -not $bad) {
     Write-Host "healthy cable device already present - skipping install"
