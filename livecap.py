@@ -206,7 +206,10 @@ def make_recognizer(model_dir: Path):
     kw = dict(tokens=str(model_dir / "tokens.txt"),
               encoder=pick("encoder"), decoder=pick("decoder"),
               joiner=pick("joiner"),
-              num_threads=os.cpu_count() or 4,
+              # half the cores — cpu_count on ASR AND denoiser
+              # oversubscribed the box (ORT intra-op spin-waits)
+              # and blew the 16ms denoise deadline
+              num_threads=max(1, (os.cpu_count() or 4) // 2),
               sample_rate=SR, feature_dim=80,
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
@@ -224,7 +227,9 @@ def make_recognizer(model_dir: Path):
 def make_denoiser():
     cfg = sherpa_onnx.OnlineSpeechDenoiserConfig()
     cfg.model.gtcrn.model = str(ROOT / "models" / "gtcrn_simple.onnx")
-    cfg.model.num_threads = os.cpu_count() or 1
+    cfg.model.num_threads = 1        # GTCRN is tiny; extra intra-op
+                                     # threads just spin-wait on the
+                                     # 16ms deadline path
     return sherpa_onnx.OnlineSpeechDenoiser(cfg)
 
 
@@ -865,8 +870,9 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 if fails["mic"] >= 3:
                     _sd_reinit(state, rep)
                 next_try["mic"] = now + backoff["mic"]
-                diag(f"mic reopen failed ({e}); "
-                     f"retry in {backoff['mic']:.0f}s")
+                if _should_log_fail(fails["mic"]):
+                    diag(f"mic reopen failed ({e}); "
+                         f"retry in {backoff['mic']:.0f}s")
                 backoff["mic"] = min(backoff["mic"] * 2, 5 * base)
         if state["cable_dead"] and now >= next_try["cable"]:
             try:
@@ -892,8 +898,9 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 if fails["cable"] >= 3:
                     _sd_reinit(state, rep)
                 next_try["cable"] = now + backoff["cable"]
-                diag(f"cable reopen failed ({e}); "
-                     f"retry in {backoff['cable']:.0f}s")
+                if _should_log_fail(fails["cable"]):
+                    diag(f"cable reopen failed ({e}); "
+                         f"retry in {backoff['cable']:.0f}s")
                 backoff["cable"] = min(backoff["cable"] * 2, 5 * base)
 
 
@@ -940,8 +947,12 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
     while not stop.is_set():
         if state is not None:                # supervisor may have
             ring = state["ring"]             # swapped these on reopen
-            if (state["mic_sr"], state["cable_sr"]) != cur_sr:
-                cur_sr = state["mic_sr"], state["cable_sr"]
+            new_sr = state["mic_sr"], state["cable_sr"]
+            # a ring appearing WITHOUT a rate change still needs rs —
+            # it was None if the cable was absent at engine start and
+            # came back at the same rate pair
+            if new_sr != cur_sr or (ring is not None and rs is None):
+                cur_sr = new_sr
                 mic_rs = Resampler(cur_sr[0], SR) \
                     if cur_sr[0] != SR else None
                 rs = Resampler(SR, cur_sr[1]) \
@@ -1488,6 +1499,8 @@ class Overlay:
                         ("them" if tag == "spk" else "you") + ": " + text)
                     if tag == "spk":
                         self.them["last"], self.them["now"] = text, ""
+                        self.tr = ""         # the old seg's
+                                             # translation is stale
                     else:
                         self.me = "you: " + text
                 elif ev[0] == "trans":
@@ -1668,6 +1681,7 @@ def main():
         mic_idx = pick_mic()
         if mic_idx is None:
             status.append(("mic","warn","no mic"))
+            mark_dead(state, "mic", rep, "no mic")
         else:
          try:
             st, mic_sr = open_mic(
@@ -1699,15 +1713,16 @@ def main():
             status.append(("cable","err","start failed"))
     workers = []
     worker_defs = []
-    if in_stream is not None:
-        # no mic stream -> no chunks ever -> the stall detector would
-        # false-positive; the engine has nothing to do anyway
-        worker_defs.append(
-            (voice_engine, "voice",
-             dict(args=(mic_q, den, ring, micasr_q, mute, den_off,
-                        gui_q),
-                  kwargs=dict(mic_sr=mic_sr, cable_sr=cable_sr,
-                              state=state, rep=rep))))
+    # engine runs even when the mic/cable failed at startup — its
+    # stall detector is what flags them dead and the supervisor is
+    # what brings them back; the engine picks up new ring/rates from
+    # `state` per chunk
+    worker_defs.append(
+        (voice_engine, "voice",
+         dict(args=(mic_q, den, ring, micasr_q, mute, den_off,
+                    gui_q),
+              kwargs=dict(mic_sr=mic_sr, cable_sr=cable_sr,
+                          state=state, rep=rep))))
     worker_defs += [
             (stream_supervisor, "stream-sup",
              dict(args=(state, state["ev"], gui_q, den, mic_q),
@@ -1739,8 +1754,9 @@ def main():
     diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
         drop_splash()
-        Overlay(gui_q, status, mute, den_off,
-                mic_active=in_stream is not None).run()
+        # mic controls always visible — the supervisor may bring the
+        # leg up later; a dead mic shows as badges, not hidden buttons
+        Overlay(gui_q, status, mute, den_off, mic_active=True).run()
     finally:
         stop.set()
         for w in workers:                # let workers flush + emit
