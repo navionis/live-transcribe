@@ -52,6 +52,39 @@ def resample_linear(x: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     return np.interp(t, np.arange(len(x)), x).astype(np.float32)
 
 
+class Resampler:
+    """Stateful linear resampler — carries fractional phase and the last
+    input sample across chunks, so total output tracks the true ratio
+    (no cumulative drift at 44.1k: 705.6 samples/chunk stays fractional)."""
+
+    def __init__(self, src_sr: int, dst_sr: int):
+        self.step = src_sr / dst_sr        # input samples per output
+        self.base_step = self.step
+        self.phase = 0.0
+        self.tail = 0.0                    # last input sample
+
+    def resample(self, x: np.ndarray) -> np.ndarray:
+        buf = np.concatenate(([self.tail], x))
+        n_out = max(0, int((len(buf) - 1 - self.phase) / self.step))
+        if n_out == 0:
+            self.tail = float(buf[-1])
+            self.phase -= len(x)
+            return np.empty(0, np.float32)
+        idx = self.phase + self.step * np.arange(n_out)
+        i = idx.astype(int)
+        f = idx - i
+        y = buf[i] * (1 - f) + buf[i + 1] * f
+        self.phase = idx[-1] + self.step - (len(buf) - 1)
+        self.tail = float(buf[-1])
+        return y.astype(np.float32)
+
+    def steer(self, err: int):
+        """Nudge the rate toward a target ring fill: err>0 = ring is
+        overfull, output slightly faster; capped at +-0.1%."""
+        adj = max(-0.001, min(0.001, err / 441000.0))
+        self.step = self.base_step / (1 + adj)
+
+
 def asr_dir() -> Path:
     models = [d for d in (ROOT / "models").iterdir()
               if (d / "tokens.txt").is_file()]
@@ -353,6 +386,9 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
                  gui_q):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue."""
     needs_reset = False
+    den_fails = 0                            # consecutive denoise errors
+    rs = Resampler(SR, cable_sr) if ring is not None else None
+    target = int(0.04 * cable_sr)            # ~40ms target ring fill
     stat_t, stat_n, stat_ms = time.time(), 0, 0.0
     while not stop.is_set():
         try:
@@ -373,13 +409,24 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
                     den.reset()
                     needs_reset = False
                 t0 = time.monotonic()
-                out = den.run(np.ascontiguousarray(x, np.float32), SR)
-                stat_ms += (time.monotonic() - t0) * 1000
-                y = np.asarray(out.samples, dtype=np.float32)
+                try:
+                    out = den.run(np.ascontiguousarray(x, np.float32), SR)
+                    stat_ms += (time.monotonic() - t0) * 1000
+                    y = np.asarray(out.samples, dtype=np.float32)
+                    den_fails = 0
+                except Exception as e:       # fail open: raw chunk out
+                    den_fails += 1
+                    y = np.ascontiguousarray(x, np.float32)
+                    needs_reset = True
+                    if den_fails == 1 or den_fails in (50, 200):
+                        put_drop(gui_q, ("err",
+                                         f"denoise bypassed: {e}"))
             if not len(y):
                 continue
             if ring is not None:
-                ring.push(resample_linear(y, SR, cable_sr))
+                fill = ring.fill()
+                rs.steer(fill - target)      # hold ~40ms jitter buffer
+                ring.push(rs.resample(y))
             put_drop(micasr_q, y)
             stat_n += 1
             if time.time() - stat_t > 5:
@@ -794,6 +841,8 @@ def main():
     else:
         try:
             ring = Ring(cable_sr // 2)  # 0.5s buffer
+            ring.push(np.zeros(int(0.04 * cable_sr),
+                               np.float32))  # 40ms prefill
             out_stream = sd.OutputStream(
                 device=cable_idx, samplerate=cable_sr, channels=1,
                 dtype="float32",
@@ -806,7 +855,7 @@ def main():
             print(f"cable found but won't open ({e}) — captions only",
                   file=sys.stderr)
 
-    mic_q = queue.Queue(maxsize=16)      # voice path: drop, don't delay
+    mic_q = queue.Queue(maxsize=10)      # voice path: <160ms, drop not delay
     micasr_q = queue.Queue(maxsize=64)   # ~1s of 16ms chunks
     qs = queue.Queue(maxsize=64)         # ~2s of 32ms chunks
     gui_q = queue.Queue(maxsize=1024)     # bounded — a stalled overlay
@@ -872,4 +921,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # console may be hidden in the built exe — surface fatal
+        # startup failures as a dialog, not silence
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, f"livecap failed to start:\n{e}",
+                "livecap", 0x10)
+        except Exception:
+            pass
+        raise
