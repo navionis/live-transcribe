@@ -25,7 +25,15 @@ import numpy as np
 import sherpa_onnx
 import sounddevice as sd
 
-ROOT = Path(__file__).resolve().parent
+def app_root() -> Path:
+    # under Nuitka (esp. --onefile), __file__ points at a temp
+    # extraction dir — use the exe's real location instead
+    if "__compiled__" in globals():
+        return Path(sys.argv[0]).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+ROOT = app_root()
 PUNCT_DIR = ROOT / "models" / "sherpa-onnx-online-punct-en-2024-08-06"
 SR = 16000
 
@@ -446,7 +454,12 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
 # ------------------------------------------------------------------ overlay
 
 BG, DIM, TXT, MUTE, ACC = "#101418", "#9ca3af", "#f9fafb", "#4b5563", "#93c5fd"
-LOGS = ROOT / "logs"
+# compiled builds may live somewhere read-only (Program Files);
+# logs go to %LOCALAPPDATA% there, repo logs/ in dev
+if "__compiled__" in globals():
+    LOGS = Path(os.environ.get("LOCALAPPDATA", ROOT)) / "livecap" / "logs"
+else:
+    LOGS = ROOT / "logs"
 CFG = LOGS / "livecap-window.json"
 
 
