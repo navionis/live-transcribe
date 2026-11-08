@@ -21,7 +21,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # models ship next to the exe (not embedded - large, swappable).
 # robocopy: excludes device-name artifacts (NUL etc.) extracted by tar
-robocopy models build\livecap.dist\models /E /XF NUL CON PRN AUX /XD "*nemotron*" /NFL /NDL /NJH /NJS | Out-Null
+robocopy models build\livecap.dist\models /E /XF NUL CON PRN AUX /NFL /NDL /NJH /NJS | Out-Null
 
 Write-Host ""
 Write-Host "built: build\livecap.dist\livecap.exe"
