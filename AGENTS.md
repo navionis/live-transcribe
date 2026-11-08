@@ -5,6 +5,9 @@ review -> PR -> merge.** Never merge without a review pass — post
 self-review notes on the PR before merging; stop before merge if the
 user wants to review.
 
+- Commit messages: plain message only — no "Generated with Devin"
+  trailer, no `Co-Authored-By` lines.
+
 - No `gh` CLI. GitHub REST API via `git credential-manager` token:
   `TOKEN=$(printf "protocol=https\nhost=github.com\n" | git credential-manager get | awk '/^password=/{sub(/^password=/,"");print}')`
 - Pass JSON bodies via `-d @file` — inline `-d '...'` payloads get mangled.
