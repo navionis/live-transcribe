@@ -79,7 +79,8 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   BEFORE retry — a stale object there blocks `_sd_reinit` (device
   re-enumeration). `_sd_reinit` itself closes whatever's still live
   and marks it dead (~1s passthrough gap) — a replugged device is
-  invisible in the frozen PortAudio list without it
+  invisible in the frozen PortAudio list without it; `state["cands"]`
+  is refreshed post-reinit since indices shift
 - `voice_engine` runs unconditionally — a mic/cable that failed at
   startup is reopened by the supervisor and the running engine
   consumes it (its own stall detector does the dead-marking)
@@ -131,7 +132,7 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   a taken chord = warn badge + diag, never fatal. Registered chords
   show as an info chip. NOTE: Ctrl+Alt is AltGr on some layouts —
   the chords can collide with typed characters there (US fine)
-- `hidden` / `in captures` info chip for
+- `hidden` / `captured` info chip for
   `SetWindowDisplayAffinity(hwnd, 0x11)` — info on failure too, not
   warn (an amber dot all session would cry wolf). Only blocks
   in-session capture — host-side RDP screenshots still see it

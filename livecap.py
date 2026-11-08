@@ -807,6 +807,9 @@ def _sd_reinit(state, rep):
     try:
         sd._terminate()
         sd._initialize()
+        # indices shift on re-enumeration — a stale candidate list
+        # would reopen the cable on the wrong device (or fail)
+        state["cands"] = cable_candidates()
         diag("PortAudio reinitialized for new devices")
         return True
     except Exception as e:
@@ -1388,7 +1391,7 @@ class Overlay:
         else:
             # info, not warn — it isn't actionable, and an amber dot
             # all session would cry wolf
-            self._set_state("cap", "info", "in captures")
+            self._set_state("cap", "info", "captured")
         r.after(30, self._poll)
 
     LVLCOL = {"ok": "#14532d", "warn": "#78350f", "err": "#7f1d1d",
@@ -1827,7 +1830,6 @@ def main():
         t.start()
         workers.append(t)
 
-    status.append(("log","info","log"))  # model name lives in diag
     diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
         drop_splash()
