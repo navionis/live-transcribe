@@ -104,37 +104,24 @@ def make_recognizer(model_dir: Path):
                 return str(fs[0])
         raise SystemExit(f"no {prefix}*.onnx in {model_dir}")
 
-    provider = "cpu"
-    for cand in ("dml", "cuda"):          # GPU when the ORT build has it
+    kw = dict(tokens=str(model_dir / "tokens.txt"),
+              encoder=pick("encoder"), decoder=pick("decoder"),
+              joiner=pick("joiner"),
+              num_threads=os.cpu_count() or 4,
+              sample_rate=SR, feature_dim=80,
+              enable_endpoint_detection=True,
+              rule1_min_trailing_silence=2.4,
+              rule2_min_trailing_silence=1.2,
+              rule3_min_utterance_length=20.0,
+              decoding_method="greedy_search")
+    for cand in ("dml", "cuda", "cpu"):   # first that ORT accepts wins
         try:
             rec = sherpa_onnx.OnlineRecognizer.from_transducer(
-                tokens=str(model_dir / "tokens.txt"),
-                encoder=pick("encoder"), decoder=pick("decoder"),
-                joiner=pick("joiner"),
-                num_threads=os.cpu_count() or 4,
-                sample_rate=SR, feature_dim=80,
-                enable_endpoint_detection=True,
-                rule1_min_trailing_silence=2.4,
-                rule2_min_trailing_silence=1.2,
-                rule3_min_utterance_length=20.0,
-                decoding_method="greedy_search", provider=cand,
-            )
-            provider = cand
-            return rec, provider
+                provider=cand, **kw)
+            return rec, cand
         except Exception:
             continue
-    rec = sherpa_onnx.OnlineRecognizer.from_transducer(
-        tokens=str(model_dir / "tokens.txt"),
-        encoder=pick("encoder"), decoder=pick("decoder"), joiner=pick("joiner"),
-        num_threads=os.cpu_count() or 4,
-        sample_rate=SR, feature_dim=80,
-        enable_endpoint_detection=True,
-        rule1_min_trailing_silence=2.4,
-        rule2_min_trailing_silence=1.2,
-        rule3_min_utterance_length=20.0,
-        decoding_method="greedy_search", provider=provider,
-    )
-    return rec, provider
+    return None, "none"
 
 
 def make_denoiser():
@@ -154,6 +141,25 @@ def make_punctuator():
 
 def result_text(res) -> str:
     return res if isinstance(res, str) else getattr(res, "text", str(res))
+
+
+_diag_log = [None]
+
+
+def diag(msg):
+    """Diagnostics channel — stderr when it exists (windowed builds can
+    have sys.stderr=None) plus a rotating log in the logs folder."""
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write(line + "\n")
+    except Exception:
+        pass
+    try:
+        if _diag_log[0] is not None:
+            _diag_log[0].write(line + "\n")
+    except Exception:
+        pass
 
 
 def put_drop(q: queue.Queue, item):
@@ -338,21 +344,29 @@ class Ring:
             self.r = self.w
 
 
-def find_cable():
-    """VB-CABLE playback endpoint — called 'CABLE Input' or shows as a
-    'Speakers (VB-Audio Point)' output. Prefer WASAPI (lower latency)
-    over MME/WDM-KS enumeration."""
+def cable_candidates():
+    """Ordered (index, sr, wasapi?) candidates for the VB-CABLE
+    playback endpoint — 'CABLE Input' or 'Speakers (VB-Audio Point)'.
+    WASAPI first (auto-convert handles mono-on-stereo shared mode),
+    then other host APIs."""
     apis = sd.query_hostapis()
+    devs = sd.query_devices()
     def ok(d):
         n = d["name"].lower()
         return ("cable input" in n or "vb-audio point" in n) \
             and d["max_output_channels"] > 0
-    for want in ("Windows WASAPI", None):
-        for i, d in enumerate(sd.query_devices()):
-            if ok(d) and (want is None
-                          or apis[d["hostapi"]]["name"] == want):
-                return i, int(d["default_samplerate"])
-    return None, None
+    out, order = [], ("Windows WASAPI", "Windows MME",
+                      "Windows DirectSound")
+    for api in order:
+        for i, d in enumerate(devs):
+            if ok(d) and apis[d["hostapi"]]["name"] == api:
+                out.append((i, int(d["default_samplerate"]),
+                            api == "Windows WASAPI"))
+    for i, d in enumerate(devs):
+        tup = (i, int(d["default_samplerate"]), False)
+        if ok(d) and tup not in out:
+            out.append(tup)
+    return out
 
 
 def pick_mic():
@@ -431,10 +445,9 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
             stat_n += 1
             if time.time() - stat_t > 5:
                 fill = ring.fill() if ring else 0
-                print(f"stat ring={fill} mic_q={mic_q.qsize()} "
-                      f"micasr={micasr_q.qsize()} "
-                      f"denoise={stat_ms/max(stat_n,1):.1f}ms",
-                      file=sys.stderr)
+                diag(f"stat ring={fill} mic_q={mic_q.qsize()} "
+                     f"micasr={micasr_q.qsize()} "
+                     f"denoise={stat_ms/max(stat_n,1):.1f}ms")
                 stat_t, stat_n, stat_ms = time.time(), 0, 0.0
         except Exception as e:
             put_drop(gui_q, ("err", f"mic engine error: {e}"))
@@ -510,8 +523,7 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
             if time.time() - stat_t > 5:
                 msg = " ".join(f"{k}:rtf={v[1]/max(v[0],0.01):.2f}"
                                for k, v in stat.items())
-                print(f"stat decode {msg} qs={qs.qsize()} micasr={qm.qsize()}",
-                      file=sys.stderr)
+                diag(f"stat decode {msg} qs={qs.qsize()} micasr={qm.qsize()}")
                 stat_t, stat = time.time(), {}
             if final:
                 with log_lock:
@@ -624,6 +636,8 @@ class Overlay:
         r.bind("<MouseWheel>", self._wheel)
         signal.signal(signal.SIGINT, self._sigint)
         r.update_idletasks()
+        r.report_callback_exception = lambda t, v, tb: diag(
+            f"tk callback: {v}")
         # WDA_EXCLUDEFROMCAPTURE: on screen normally, invisible to
         # screenshots and screen-share capture (Windows 10 2004+)
         hidden = False
@@ -821,39 +835,46 @@ def main():
 
     den = make_denoiser()
     model_dir = asr_dir()
-    print(f"ASR model: {model_dir.name}", file=sys.stderr)
+    diag(f"ASR model: {model_dir.name}")
     rec, asr_provider = make_recognizer(model_dir)
-    print(f"ASR provider: {asr_provider}", file=sys.stderr)
+    diag(f"ASR provider: {asr_provider}")
     punct = None if "nemotron" in model_dir.name.lower() else make_punctuator()
     pipe = Pipeline(rec, punct)
 
     status = []
-    cable_idx, cable_sr = find_cable()
     ring = out_stream = None
-    if cable_idx is None:
+    cands = cable_candidates()
+    if not cands:
         status.append("no VB-CABLE")
-        print("VB-CABLE not found — captions only, no mic passthrough",
-              file=sys.stderr)
+        diag("VB-CABLE not found — captions only, no mic passthrough")
     elif not cable_usable():
         status.append("cable hidden")
-        print("cable not visible to apps (session) — mic capture off",
-              file=sys.stderr)
+        diag("cable not visible to apps (session) — mic capture off")
     else:
-        try:
-            ring = Ring(cable_sr // 2)  # 0.5s buffer
-            ring.push(np.zeros(int(0.04 * cable_sr),
-                               np.float32))  # 40ms prefill
-            out_stream = sd.OutputStream(
-                device=cable_idx, samplerate=cable_sr, channels=1,
-                dtype="float32",
-                callback=lambda data, frames, t, s:
-                    data.__setitem__((slice(None), 0), ring.pull(frames)))
-            status.append("cable ✓")
-        except Exception as e:
-            ring = out_stream = None
+        for cable_idx, cable_sr, wasapi in cands:
+            kw = {}
+            if wasapi:                    # mono on stereo shared mode
+                kw["extra_settings"] = sd.WasapiSettings(
+                    auto_convert=True)
+            try:
+                ring = Ring(cable_sr // 2)  # 0.5s buffer
+                ring.push(np.zeros(int(0.04 * cable_sr),
+                                   np.float32))  # 40ms prefill
+                out_stream = sd.OutputStream(
+                    device=cable_idx, samplerate=cable_sr, channels=1,
+                    dtype="float32",
+                    callback=lambda data, frames, t, s:
+                        data.__setitem__((slice(None), 0),
+                                        ring.pull(frames)), **kw)
+                status.append("cable ✓")
+                diag(f"cable open: dev{cable_idx} "
+                     f"{'wasapi+autoconv' if wasapi else 'plain'}")
+                break
+            except Exception as e:
+                ring = out_stream = None
+                diag(f"cable candidate {cable_idx} failed: {e}")
+        if out_stream is None:
             status.append("cable open failed")
-            print(f"cable found but won't open ({e}) — captions only",
-                  file=sys.stderr)
 
     mic_q = queue.Queue(maxsize=10)      # voice path: <160ms, drop not delay
     micasr_q = queue.Queue(maxsize=64)   # ~1s of 16ms chunks
@@ -865,6 +886,12 @@ def main():
     LOGS.mkdir(parents=True, exist_ok=True)
     log = open(LOGS / f"livecap-{time.strftime('%Y%m%d-%H%M%S')}.txt",
                "w", encoding="utf-8", buffering=1)
+    _diag_log[0] = open(LOGS / "livecap-diag.log", "a",
+                        encoding="utf-8", buffering=1)
+    sys.excepthook = lambda t, v, tb: diag(f"fatal: {v}")
+    threading.excepthook = lambda a: (
+        diag(f"thread {a.thread.name} died: {a.exc_value}"),
+        put_drop(gui_q, ("err", f"{a.thread.name} died")))
     trans_q = queue.Queue(maxsize=4) if args.lang else None
 
     in_stream = None
@@ -886,7 +913,7 @@ def main():
             status.append("mic ✓")
          except Exception as e:
             status.append("no mic")
-            print(f"no mic input ({e})", file=sys.stderr)
+            diag(f"no mic input ({e})")
     if out_stream is not None:
         out_stream.start()
     threading.Thread(target=voice_engine, daemon=True,
@@ -904,8 +931,7 @@ def main():
                                args.trans_email)).start()
 
     status.append(model_dir.name[:30])
-    print("livecap running — mic -> denoise -> cable, captions for both",
-          file=sys.stderr)
+    diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
         Overlay(gui_q, status, mute, den_off,
                 mic_active=in_stream is not None).run()
