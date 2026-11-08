@@ -897,6 +897,8 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                     scan_wait = min(       # PortAudio doesn't — each
                         scan_wait * 2,     # failed discovery bounces
                         120)               # the mic ~1s; slow down
+                    next_scan = now + scan_wait   # apply it NOW, not
+                                                  # from the next pass
         if state["mic_dead"] and now >= next_try["mic"]:
             old = state["in"]
             if old is not None:                # drop the dead stream
