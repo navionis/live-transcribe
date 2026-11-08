@@ -543,6 +543,52 @@ class ResetFailTest(unittest.TestCase):
         self.assertEqual(denoise[-1], ("state", "denoise", "ok", ""))
 
 
+class LateRingTest(unittest.TestCase):
+    """A cable that reopens at the SAME rate pair must still get an
+    rs built — it was None when the engine started with no ring, and
+    the rate check alone never rebuilds it."""
+
+    def test_ring_appears_same_rates(self):
+        mic_q, micasr_q, gui_q = (queue.Queue(), queue.Queue(),
+                                  queue.Queue())
+        mute, den_off = threading.Event(), threading.Event()
+        state = {"in": None, "out": None, "ring": None,
+                 "mic_sr": livecap.SR, "cable_sr": livecap.SR,
+                 "mic_dead": False, "cable_dead": False,
+                 "ev": threading.Event()}
+        t = threading.Thread(
+            target=livecap.voice_engine,
+            args=(mic_q, _FakeDen(), None, micasr_q, mute, den_off,
+                  gui_q),
+            kwargs=dict(mic_sr=livecap.SR, cable_sr=livecap.SR,
+                        state=state),
+            daemon=True)
+        t.start()
+        mic_q.put(np.zeros(256, np.float32))     # ring still None
+        time.sleep(0.1)
+        ring = livecap.Ring(livecap.SR // 2)
+        state["ring"] = ring                     # cable reopens @16k
+        for _ in range(3):
+            mic_q.put(np.zeros(256, np.float32))
+        time.sleep(0.3)
+        livecap.stop.set()
+        t.join(2)
+        livecap.stop.clear()
+        mic_errs = []
+        while True:
+            try:
+                e = gui_q.get_nowait()
+            except queue.Empty:
+                break
+            if e[0] == "state" and e[1] == "mic" and e[2] == "err":
+                mic_errs.append(e)
+        # old code: rs.steer raised AttributeError every chunk ->
+        # 'mic engine error' badge, micasr_q starved, ring empty
+        self.assertFalse(mic_errs, mic_errs)
+        self.assertGreater(ring.fill(), 0)
+        self.assertGreater(micasr_q.qsize(), 0)
+
+
 class MicStallTest(unittest.TestCase):
     """P1 — 1.5s of silence on mic_q reports an error; the next chunk
     clears it; mute doesn't suppress."""

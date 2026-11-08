@@ -49,7 +49,10 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   ceil n_out so phase stays >= 0 — a floor left it negative at
   step>1 and read future samples); `steer()` closed-loops the rate
   toward a 40ms ring fill (5ms deadband, +-0.1% cap)
-- `num_threads = os.cpu_count()` on ASR, denoiser, punct
+- `num_threads`: ASR = half of `os.cpu_count()`, denoiser = 1,
+  punct = `os.cpu_count()` — cpu_count on ASR AND denoiser
+  oversubscribed the box (ORT intra-op spin-waits blew the 16ms
+  denoise deadline); GTCRN is tiny and needs no parallelism
 - ASR provider hardcoded `cpu` — the stock sherpa-onnx pip wheel is
   CPU-only and silently falls back for other provider strings, so
   `make_recognizer` reports what the build actually has
@@ -70,8 +73,14 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - single-instance: named mutex `Local\livecap-singleton` first thing
   in `main`; `loading_splash()` shows during model load
 - `stream_supervisor` reopens dead mic/cable streams (finished_callback
-  or stall -> `mark_dead` -> backoff 1/2/5s) — engine picks up new
-  ring/rates from the shared `state` dict each chunk
+  or stall -> `mark_dead` -> backoff 1/2/5s, retry logging throttled
+  via `_should_log_fail`) — engine picks up new ring/rates from the
+  shared `state` dict each chunk, incl. `rs` when a ring appears at
+  the SAME rate pair; `pick_mic()` failure is `mark_dead` too so
+  hotplug recovers
+- `voice_engine` runs unconditionally — a mic/cable that failed at
+  startup is reopened by the supervisor and the running engine
+  consumes it (its own stall detector does the dead-marking)
 - worker loops: per-chunk try/except — one bad chunk badges err and
   continues, thread survives
 - stats on stderr every 5s: ring fill + under/over counts, queue
@@ -96,7 +105,7 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   streams open `latency="low"`, logged via `stream.latency`
 - `sd.OutputStream`/`sd.InputStream` open failures degrade to
   captions-only, never crash; `in_stream` assigned only after
-  `start()` succeeds (buttons can't show for a dead mic)
+  `start()` succeeds
 
 ## Overlay
 
@@ -108,7 +117,8 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   dot (worst level wins), `info` items share one compact chip that
   hides while any err shows; real tk.Button controls pack FIRST so
   badges can't clip them; mic/denoise buttons and `m`/`d` hotkeys
-  exist only when `mic_active`
+  always exist (`mic_active=True` — a supervisor-reopened leg still
+  needs them; a dead mic shows as badges)
 - `state` events never touch the caption line — only badges/dot;
   Esc prompt lives in its own `esc_lbl`
 - MIC MUTED is a persistent red badge added/removed on toggle
@@ -186,7 +196,9 @@ Result: `build\livecap.dist\livecap.exe`, models beside it.
 
 ## Decisions (don't reopen without reason)
 
-- `num_threads = os.cpu_count()` — user asked for max-resource use
+- ASR = half cores, denoiser = 1 thread — replaced the earlier
+  cpu_count-everywhere decision: ORT intra-op spin-waits
+  oversubscribed cores during concurrent ASR decode
 - translation on by default (ja) — user's stated requirement
 - Esc -> double-press quit, deliberately
 
