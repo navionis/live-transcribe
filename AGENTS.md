@@ -73,8 +73,11 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - `stream_supervisor` reopens dead mic/cable streams (finished_callback
   or stall -> `mark_dead` -> backoff 1/2/5s, retry logging throttled
   via `_should_log_fail`) — engine picks up new ring/rates from the
-  shared `state` dict each chunk, incl. `rs` when a ring appears at
-  the SAME rate pair; `pick_mic()` failure is `mark_dead` too so
+  shared `state` dict each chunk; `rs` rebuilds on rate change AND
+  on ring OBJECT swap at the same rate (a reopened cable's skew
+  differs from what `rs.trim` learned; ring->None drops rs so the
+  stat path never fills a missing ring); `pick_mic()` failure is
+  `mark_dead` too so
   hotplug recovers. Dead streams are closed and dropped from `state`
   BEFORE retry — a stale object there blocks `_sd_reinit` (device
   re-enumeration). `_sd_reinit` itself closes whatever's still live
