@@ -110,7 +110,7 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - Consequence: mic->denoise->cable->Meet chain cannot fully work in
   an RDP session; works on a local machine.
 
-## Verified facts (4 vCPU Hyper-V, no GPU)
+## Verified facts (6 vCPU Hyper-V, no GPU)
 
 - zipformer int8 RTF ~0.5 — only model sustaining real-time;
   nemotron-0.6b RTF ~2.5 (offline use only). GTCRN RTF ~0.45.
