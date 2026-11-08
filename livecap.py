@@ -48,7 +48,8 @@ def asr_dir() -> Path:
     models = [d for d in (ROOT / "models").iterdir()
               if (d / "tokens.txt").is_file()]
     # zipformer is the only bundled model that sustains real-time on this cpu
-    models.sort(key=lambda d: ("zipformer" not in d.name, d.name))
+    models.sort(key=lambda d: (not ("zipformer" in d.name
+                                    and "stream" in d.name), d.name))
     if not models:
         raise SystemExit("no ASR model (with tokens.txt) under models/")
     return models[0]
@@ -139,13 +140,25 @@ def lang_code(code: str) -> str:
 
 def translator_worker(tq, gui_q, log, log_lock, lang, email):
     """Translate finalized [them] segments off the caption critical path."""
-    from deep_translator import GoogleTranslator, MyMemoryTranslator
     try:
-        tr = GoogleTranslator(source="en", target=lang.split("-")[0])
+        from deep_translator import GoogleTranslator, MyMemoryTranslator
+    except Exception as e:
+        put_drop(gui_q, ("trans", f"[translation unavailable: {e}]"))
+        return
+    gmap = {"zh-CN": "zh-CN", "zh-TW": "zh-TW", "nb-NO": "no"}
+    gcode = gmap.get(lang, lang.split("-")[0])
+    try:
+        tr = GoogleTranslator(source="en", target=gcode)
+    except Exception as e:
+        tr = None
+        put_drop(gui_q, ("trans", f"[google init failed: {e}]"))
+    try:
         fallback = MyMemoryTranslator(source="en-US", target=lang,
                                       email=email)
     except Exception as e:
-        put_drop(gui_q, ("trans", f"[translation unavailable: {e}]"))
+        fallback = None
+        put_drop(gui_q, ("trans", f"[mymemory init failed: {e}]"))
+    if tr is None and fallback is None:
         return
     warned = False
     while not stop.is_set():
@@ -158,13 +171,17 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
                 text = tq.get_nowait()
             except queue.Empty:
                 break
+        out = None
         try:
-            out = tr.translate(text)
+            if tr is not None:
+                out = tr.translate(text)
         except Exception:
+            pass
+        if out is None and fallback is not None:
             try:
                 out = fallback.translate(text)
             except Exception:
-                out = None
+                pass
         if out:
             warned = False
             put_drop(gui_q, ("trans", out))
@@ -254,13 +271,31 @@ class Ring:
 
 def find_cable():
     """VB-CABLE playback endpoint — called 'CABLE Input' or shows as a
-    'Speakers (VB-Audio Point)' output depending on Windows/driver."""
+    'Speakers (VB-Audio Point)' output. Prefer WASAPI (lower latency)
+    over MME/WDM-KS enumeration."""
+    apis = sd.query_hostapis()
+    def ok(d):
+        n = d["name"].lower()
+        return ("cable input" in n or "vb-audio point" in n) \
+            and d["max_output_channels"] > 0
+    for want in ("Windows WASAPI", None):
+        for i, d in enumerate(sd.query_devices()):
+            if ok(d) and (want is None
+                          or apis[d["hostapi"]]["name"] == want):
+                return i, int(d["default_samplerate"])
+    return None, None
+
+
+def pick_mic():
+    """Mic index; avoids cable endpoints — a virtual capture device as
+    default input would feed livecap's own output back to itself."""
     for i, d in enumerate(sd.query_devices()):
         n = d["name"].lower()
-        if ("cable input" in n or "vb-audio point" in n) \
-                and d["max_output_channels"] > 0:
-            return i, int(d["default_samplerate"])
-    return None, None
+        if d["max_input_channels"] > 0 and "cable" not in n \
+                and "vb-audio" not in n and "mapper" not in n \
+                and "primary" not in n:
+            return i
+    return None
 
 
 def cable_usable() -> bool:
@@ -275,10 +310,12 @@ def cable_usable() -> bool:
         return False
 
 
-def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off):
+def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
+                 gui_q):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue."""
     needs_reset = False
-    while not stop.is_set():
+    try:
+      while not stop.is_set():
         try:
             x = mic_q.get(timeout=0.02)
         except queue.Empty:
@@ -300,6 +337,8 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off):
         if ring is not None:
             ring.push(resample_linear(y, SR, cable_sr))
         put_drop(micasr_q, y)
+    except Exception as e:
+        put_drop(gui_q, ("err", f"mic engine died: {e}"))
 
 
 # -------------------------------------------------------- speaker -> [them]
@@ -351,7 +390,9 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
                 pass
         return None
 
-    while not stop.is_set():
+    last_p = {}
+    try:
+      while not stop.is_set():
         item = get()
         if item is None:
             break
@@ -373,7 +414,11 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
             # display (leave already-cased models like nemotron alone)
             if p.isupper():
                 p = p.capitalize()
-            put_drop(gui_q, ("partial", tag, p))
+            if p != last_p.get(tag):       # dedupe identical partials
+                last_p[tag] = p
+                put_drop(gui_q, ("partial", tag, p))
+    except Exception as e:
+        put_drop(gui_q, ("err", f"ASR engine died: {e}"))
     pipe.flush()
 
 
@@ -385,9 +430,11 @@ CFG = LOGS / "livecap-window.json"
 
 
 class Overlay:
-    def __init__(self, gui_q, status_items, mute, den_off):
+    def __init__(self, gui_q, status_items, mute, den_off,
+                 mic_active=True):
         self.q = gui_q
         self.mute, self.den_off = mute, den_off
+        self.mic_active = mic_active
         self.them = {"last": "", "now": ""}
         self.me = ""
         self.tr = ""
@@ -401,6 +448,9 @@ class Overlay:
         w, h = geo.get("w", 560), geo.get("h", 100)
         x = geo.get("x", (r.winfo_screenwidth() - w) // 2)
         y = geo.get("y", r.winfo_screenheight() - h - 90)
+        # clamp into the visible screen — saved geometry can land off-screen
+        x = min(max(x, 0), max(0, r.winfo_screenwidth() - w))
+        y = min(max(y, 0), max(0, r.winfo_screenheight() - h))
         r.geometry(f"{w}x{h}+{x}+{y}")
         mk = lambda **kw: tk.Label(r, bg=BG, anchor="w", justify="left",
                                    wraplength=w - 24, **kw)
@@ -411,8 +461,9 @@ class Overlay:
         self.badges.pack(side="left", padx=(10, 4))
         for item in status_items:
             self._badge(item)
-        self.mute_lbl = self._btn(top, "mic: on", self.tgl_mute)
-        self.den_lbl = self._btn(top, "denoise: on", self.tgl_den)
+        if self.mic_active:
+            self.mute_lbl = self._btn(top, "mic: on", self.tgl_mute)
+            self.den_lbl = self._btn(top, "denoise: on", self.tgl_den)
         self._btn(top, "copy all", self.copy_all)
         self._btn(top, "copy", self.copy_last)
         self._btn(top, "×", self.close)
@@ -514,12 +565,14 @@ class Overlay:
     def tgl_mute(self):
         on = self.mute.is_set()                  # muted now? -> unmute
         (self.mute.clear if on else self.mute.set)()
-        self.mute_lbl.config(text="mic: on" if on else "mic: muted")
+        if self.mic_active:
+            self.mute_lbl.config(text="mic: on" if on else "mic: muted")
 
     def tgl_den(self):
         on = self.den_off.is_set()               # denoise off? -> on
         (self.den_off.clear if on else self.den_off.set)()
-        self.den_lbl.config(text="denoise: on" if on else "denoise: off")
+        if self.mic_active:
+            self.den_lbl.config(text="denoise: on" if on else "denoise: off")
 
     def copy_last(self):
         self.root.clipboard_clear()
@@ -662,6 +715,7 @@ def main():
     else:
         try:
             in_stream = sd.InputStream(
+                device=pick_mic(),
                 samplerate=SR, channels=1, dtype="float32",
                 blocksize=den.frame_shift_in_samples,
                 callback=lambda d, f, t, s: put_drop(mic_q, d[:, 0].copy()))
@@ -674,7 +728,7 @@ def main():
         out_stream.start()
     threading.Thread(target=voice_engine, daemon=True,
                      args=(mic_q, den, ring, cable_sr, micasr_q,
-                           mute, den_off)).start()
+                           mute, den_off, gui_q)).start()
     threading.Thread(target=loopback_pump, daemon=True, args=(qs,)).start()
     threading.Thread(target=asr_consumer, daemon=True,
                      args=(pipe, qs, micasr_q, gui_q, log, log_lock,
@@ -690,7 +744,8 @@ def main():
     print("livecap running — mic -> denoise -> cable, captions for both",
           file=sys.stderr)
     try:
-        Overlay(gui_q, status, mute, den_off).run()
+        Overlay(gui_q, status, mute, den_off,
+                mic_active=in_stream is not None).run()
     finally:
         stop.set()
         log.close()
