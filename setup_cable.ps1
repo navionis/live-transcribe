@@ -9,8 +9,6 @@
 
 param(
     [string]$Url = "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack46.zip",
-    [string]$CaptureName = "livecap Microphone",
-    [string]$RenderName = "livecap Speaker",
     [switch]$NoReboot
 )
 
@@ -73,25 +71,9 @@ else {
     Write-Host "REBOOT required for CABLE Input/Output to appear"
 }
 
-# --- rename endpoints to friendly names (works once they exist) ---
-$mmroot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio'
-$nameKey = '{a45c254e-df1c-4efd-8020-67d146a850e0},2'
-$targets = @(
-    @{ role = 'Capture'; match = 'CABLE Output'; name = $CaptureName },
-    @{ role = 'Render';  match = 'CABLE Input';  name = $RenderName }
-)
-foreach ($t in $targets) {
-    $rolePath = "$mmroot\" + $t.role
-    foreach ($ep in (Get-ChildItem $rolePath -ErrorAction SilentlyContinue)) {
-        $p = Join-Path $ep.PSPath 'Properties'
-        $props = Get-ItemProperty $p -ErrorAction SilentlyContinue
-        $cur = $props.$nameKey
-        if ($cur -and $cur -like ("*" + $t.match + "*") -and $cur -ne $t.name) {
-            Set-ItemProperty $p -Name $nameKey -Value $t.name
-            Write-Host ("renamed '" + $cur + "' -> '" + $t.name + "'")
-        }
-    }
-}
+# NOTE: endpoint names (CABLE Output / CABLE Input) can't be renamed
+# programmatically — audiosrv owns the write; verified denied even as
+# SYSTEM and via IPropertyStore. Rename via mmsys.cpl GUI if desired.
 
 if (-not $NoReboot -and ($bad -or -not $good)) {
     $r = Read-Host "reboot now? [y/N]"
