@@ -871,6 +871,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
     next_try = {"mic": 0.0, "cable": 0.0}
     fails = {"mic": 0, "cable": 0}
     next_scan = 0.0                      # cable rediscovery cadence
+    scan_wait = 10.0                     # backs off on failed discovery
     while not stop.is_set():
         wait = 0.5                      # wake early for a pending retry
         for comp in ("mic", "cable"):
@@ -884,7 +885,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
         # it only becomes visible after a PortAudio reinit (which the
         # 30s cooldown bounds); costs the mic ~1s once
         if state.get("cable_absent") and now >= next_scan:
-            next_scan = now + 10
+            next_scan = now + scan_wait
             if cable_usable_threaded() and _sd_reinit(state, rep):
                 if state["cands"]:
                     state["cable_absent"] = False
@@ -892,6 +893,10 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                     next_try["cable"] = 0.0
                     ev.set()
                     diag("cable discovered")
+                else:                      # WASAPI sees it but
+                    scan_wait = min(       # PortAudio doesn't — each
+                        scan_wait * 2,     # failed discovery bounces
+                        120)               # the mic ~1s; slow down
         if state["mic_dead"] and now >= next_try["mic"]:
             old = state["in"]
             if old is not None:                # drop the dead stream
@@ -1002,18 +1007,19 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
         if state is not None:                # supervisor may have
             ring = state["ring"]             # swapped these on reopen
             new_sr = state["mic_sr"], state["cable_sr"]
-            rates_changed = new_sr != cur_sr
+            # mic rate ONLY — a cable reopen at a new rate must not
+            # break the input resampler; pend's leftover partial frame
+            # is at the old rate too
+            if new_sr[0] != cur_sr[0]:
+                mic_rs = Resampler(new_sr[0], SR) \
+                    if new_sr[0] != SR else None
+                pend = np.empty(0, np.float32)
             # rebuild rs on a ring OBJECT swap too, not just a rate
             # change — a reopened cable's clock skew differs from what
             # rs.trim learned; ring->None drops rs so the stat path
-            # never calls ring.fill() on a missing ring. mic_rs only
-            # resets on a real mic-rate change (replug drains it via
-            # the mic_t block below)
-            if rates_changed or ring is not cur_ring \
+            # never calls ring.fill() on a missing ring
+            if new_sr != cur_sr or ring is not cur_ring \
                     or (ring is not None and rs is None):
-                if rates_changed:
-                    mic_rs = Resampler(new_sr[0], SR) \
-                        if new_sr[0] != SR else None
                 cur_sr, cur_ring = new_sr, ring
                 rs = Resampler(SR, cur_sr[1]) \
                     if ring is not None else None
@@ -1106,7 +1112,7 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                 ring.push(rs.resample(y))
             put_drop(micasr_q, y)
             if time.time() - stat_t > 5:
-                if rs is not None:
+                if rs is not None and ring is not None:
                     # saturated AND still off-target = real skew;
                     # trim alone at the cap is just windup
                     if abs(rs.trim) > 0.0009 and abs(

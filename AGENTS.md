@@ -76,8 +76,9 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   shared `state` dict each chunk; `rs` rebuilds on rate change AND
   on ring OBJECT swap at the same rate (a reopened cable's skew
   differs from what `rs.trim` learned; ring->None drops rs so the
-  stat path never fills a missing ring); `pick_mic()` failure is
-  `mark_dead` too so
+  stat path never fills a missing ring). `mic_rs`/`pend` reset ONLY
+  on a mic-rate change — a cable reopen must not break the input
+  resampler; `pick_mic()` failure is `mark_dead` too so
   hotplug recovers. Dead streams are closed and dropped from `state`
   BEFORE retry — a stale object there blocks `_sd_reinit` (device
   re-enumeration). `_sd_reinit` itself closes whatever's still live
@@ -86,8 +87,10 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   is refreshed post-reinit since indices shift. 30s global cooldown
   (`reinit_t`) — mic and cable failures can't bounce each other.
   `cable_absent` (cable missing/hidden at startup) -> supervisor
-  rescans every 10s via `cable_usable_threaded()` (COM on that
-  thread) + `_sd_reinit` -> "cable discovered"
+  rescans via `cable_usable_threaded()` (COM on that thread) +
+  `_sd_reinit` -> "cable discovered"; scan interval backs off 10s ->
+  120s when WASAPI sees the cable but PortAudio doesn't (each failed
+  discovery bounces the mic ~1s)
 - `voice_engine` drains stale device chunks + resets
   resampler/pend/denoiser when `mic_t` bumps (supervisor reopen
   marker) — a same-rate replug leaves no leftover fragment
