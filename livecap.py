@@ -2,7 +2,7 @@
 """livecap — Krisp-style live captions + mic denoise passthrough.
 
   mic (16k) -> GTCRN denoise -> VB-CABLE virtual mic (what call apps hear)
-                             -> tap -> [you] caption
+           -> [you] caption (raw mic — denoise can eat consonants)
   speaker loopback -> streaming ASR -> [them] caption
 
 Needs VB-CABLE installed and selected as the mic in your call app for the
@@ -987,7 +987,7 @@ def voice_stat(ring, mic_q, micasr_q, avg_ms, max_ms, slow, fails):
 def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                  mic_sr=SR, cable_sr=SR, stall_after=1.5, state=None,
                  rep=None):
-    """mic -> denoise -> ring buffer for cable + tap into ASR queue.
+    """mic -> denoise -> ring buffer for cable; raw chunk -> ASR queue.
     `state` (optional shared dict) lets the stream supervisor swap
     ring/rates on reopen — the engine picks them up per chunk."""
     rep = rep or Reporter(gui_q)             # dedupes; ok clears badges
@@ -1069,6 +1069,10 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                 muted = False                # buffer or the first
                 if ring is not None:         # bursts underrun
                     ring.reset(target)
+            # [you] captions tap the RAW chunk, not the denoised one —
+            # GTCRN can eat consonants, and captions shouldn't depend
+            # on denoise output at all
+            put_drop(micasr_q, x)
             if den_off.is_set():             # passthrough without denoise
                 y = np.ascontiguousarray(x, np.float32)
                 needs_reset = True
@@ -1112,7 +1116,6 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                     fill = ring.fill()         # post-trim, not stale
                 rs.steer(fill - target, cur_sr[1])
                 ring.push(rs.resample(y))
-            put_drop(micasr_q, y)
             if time.time() - stat_t > 5:
                 if rs is not None and ring is not None:
                     # saturated AND still off-target = real skew;
@@ -1428,13 +1431,13 @@ class Overlay:
             lbl.pack(fill="x", padx=12)
         grip = mk(fg=MUTE, font=("Segoe UI", 8), text="◢",
                   cursor="size_nw_se")
+        self._grip = grip
         grip.pack(anchor="se", padx=4)
         grip.bind("<Button-1>", self._rs_down)
-        grip.bind("<B1-Motion>", self._rs_move)
 
         for wdg in (r, top, self.badges, *self.text_lbls):
             wdg.bind("<Button-1>", self._down)
-            wdg.bind("<B1-Motion>", self._move)
+        r.bind("<Configure>", self._resized)
         r.bind("<Escape>", self._esc)
         r.bind("m", lambda e: self.tgl_mute())
         r.bind("d", lambda e: self.tgl_den())
@@ -1531,23 +1534,42 @@ class Overlay:
         except Exception:
             pass
 
-    def _down(self, e):
-        self._dx, self._dy = e.x_root - self.root.winfo_x(), \
-            e.y_root - self.root.winfo_y()
+    def _native_nc(self, hit):
+        """Hand a drag to Windows' own modal loop — WM_NCLBUTTONDOWN
+        on a caption/grip area. The OS moves/resizes the window with
+        ZERO Python work per mouse event, so ASR/decode GIL pressure
+        can't freeze a drag the way B1-Motion -> geometry() did."""
+        import ctypes
+        u = ctypes.windll.user32
+        u.ReleaseCapture()
+        u.SendMessageW(int(self.root.wm_frame(), 16), 0x00A1, hit, 0)
 
-    def _move(self, e):
-        self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
+    def _down(self, e):
+        if isinstance(e.widget, tk.Button) or e.widget is self._grip:
+            return                       # buttons/grip keep their own
+        try:                             # behavior; anything else is
+            self._native_nc(0x2)         # a caption area -> HTCAPTION
+        except Exception:
+            pass
 
     def _rs_down(self, e):
-        self._rx, self._ry = e.x_root, e.y_root
-        self._rw, self._rh = self.root.winfo_width(), self.root.winfo_height()
+        try:
+            self._native_nc(0x11)        # HTBOTTOMRIGHT
+        except Exception:
+            pass
 
-    def _rs_move(self, e):
-        w = max(int(360 * self.dpi), self._rw + e.x_root - self._rx)
-        h = max(int(60 * self.dpi), self._rh + e.y_root - self._ry)
-        self.root.geometry(f"{w}x{h}")
+    def _resized(self, e):
+        """Wrap labels to the new width and clamp a minimum size —
+        native resize doesn't run our old _rs_move per-event code."""
+        if e.widget is not self.root:
+            return
+        wpl = e.width - int(24 * self.dpi)
         for lbl in self.text_lbls:
-            lbl.config(wraplength=w - int(24 * self.dpi))
+            lbl.config(wraplength=wpl)
+        w = max(int(360 * self.dpi), e.width)
+        h = max(int(60 * self.dpi), e.height)
+        if (w, h) != (e.width, e.height):
+            self.root.geometry(f"{w}x{h}")
 
     def _wheel(self, e):
         if e.state & 0x4:                        # ctrl+wheel: font size
