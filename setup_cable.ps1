@@ -71,9 +71,20 @@ else {
     Write-Host "REBOOT required for CABLE Input/Output to appear"
 }
 
-# NOTE: endpoint names (CABLE Output / CABLE Input) can't be renamed
-# programmatically — audiosrv owns the write; verified denied even as
-# SYSTEM and via IPropertyStore. Rename via mmsys.cpl GUI if desired.
+# NOTE: endpoint names can't be renamed programmatically (audiosrv-
+# locked; denied even as SYSTEM and via IPropertyStore). The only
+# path is mmsys.cpl - so open it and show the user what to click.
+if ($good) {
+    Start-Process 'control' 'mmsys.cpl,,1'   # Sound -> Recording tab
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.MessageBox]::Show(
+        "Recording tab is open.`n`n" +
+        "1. Right-click 'CABLE Output' -> Properties`n" +
+        "2. Top text field -> 'livecap Microphone'`n" +
+        "3. OK, then Playback tab -> same for 'CABLE Input' -> 'livecap Speaker'",
+        'Rename cable endpoints',
+        'OK', 'Information') | Out-Null
+}
 
 if (-not $NoReboot -and ($bad -or -not $good)) {
     $r = Read-Host "reboot now? [y/N]"
