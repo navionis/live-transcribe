@@ -447,8 +447,8 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
                     y = np.ascontiguousarray(x, np.float32)
                     needs_reset = True
                     if den_fails == 1 or den_fails in (50, 200):
-                        put_drop(gui_q, ("err",
-                                         f"denoise bypassed: {e}"))
+                        put_drop(gui_q, ("state", "denoise", "err",
+                                         f"bypassed: {e}"))
             if not len(y):
                 continue
             if ring is not None:
@@ -463,14 +463,13 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
                         rs.step - rs.base_step) / rs.base_step > 0.0009 \
                         and not getattr(rs, "_sat", False):
                     rs._sat = True
-                    put_drop(gui_q, ("err",
-                                     "clock skew saturating resampler"))
+                    put_drop(gui_q, ("state", "cable", "err", "clock skew saturating"))
                 diag(f"stat ring={fill} mic_q={mic_q.qsize()} "
                      f"micasr={micasr_q.qsize()} "
                      f"denoise={stat_ms/max(stat_n,1):.1f}ms")
                 stat_t, stat_n, stat_ms = time.time(), 0, 0.0
         except Exception as e:
-            put_drop(gui_q, ("err", f"mic engine error: {e}"))
+            put_drop(gui_q, ("state", "mic", "err", f"mic engine error: {e}"))
 
 
 # -------------------------------------------------------- speaker -> [them]
@@ -509,8 +508,7 @@ def loopback_pump(qs, gui_q):
                     if sp.id != speaker_id:
                         if speaker_id is not None:
                             diag(f"speaker changed -> {sp.name}")
-                            put_drop(gui_q, ("err",
-                                             "speaker changed — reconnecting"))
+                            put_drop(gui_q, ("state", "speaker", "warn", "reconnecting"))
                         speaker_id = sp.id
                         close_rec()
                 if rec is None:
@@ -519,7 +517,7 @@ def loopback_pump(qs, gui_q):
                         if m.isloopback and m.id == speaker_id), None)
                     if mic is None:
                         if not notified:
-                            put_drop(gui_q, ("err", "no speaker loopback"))
+                            put_drop(gui_q, ("state", "speaker", "err", "no loopback device"))
                             notified = True
                         time.sleep(backoff)
                         backoff = min(backoff * 2, 5)
@@ -528,16 +526,14 @@ def loopback_pump(qs, gui_q):
                     rec = rec_ctx.__enter__()
                     backoff = 1.0
                     if notified:
-                        put_drop(gui_q, ("err",
-                                         "speaker capture recovered"))
+                        put_drop(gui_q, ("state", "speaker", "ok", "recovered"))
                         notified = False
                     diag("speaker capture ok")
                 put_drop(qs, rec.record(512)[:, 0])
             except Exception as e:
                 close_rec()
                 if not notified:
-                    put_drop(gui_q, ("err",
-                                     f"speaker capture failed: {e}"))
+                    put_drop(gui_q, ("state", "speaker", "err", f"capture failed: {e}"))
                     notified = True
                 diag(f"loopback error: {e}; retry in {backoff:.0f}s")
                 time.sleep(backoff)
@@ -608,7 +604,7 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None):
                     last_p[tag] = p
                     put_drop(gui_q, ("partial", tag, p))
         except Exception as e:
-            put_drop(gui_q, ("err", f"ASR {tag} decode error: {e}"))
+            put_drop(gui_q, ("state", f"asr-{tag}", "err", f"decode err: {e}"))
     final = pipe.flush(tag)                # emit the last utterance
     if final:
         with log_lock:
@@ -673,8 +669,12 @@ class Overlay:
         top.pack(fill="x", pady=(0, 2))
         self.badges = tk.Frame(top, bg=BG)
         self.badges.pack(side="left", padx=(10, 4))
-        for item in status_items:
-            self._badge(item)
+        self.dot = tk.Label(self.badges, text="●", fg="#16a34a",
+                            bg=BG, font=("Segoe UI", 10))
+        self.dot.pack(side="left", padx=(0, 6))
+        self.state_lbls, self.state_lvl = {}, {}
+        for comp, lvl, txt in status_items:
+            self._set_state(comp, lvl, txt)
         if self.mic_active:
             self.mute_lbl = self._btn(top, "mic: on", self.tgl_mute)
             self.den_lbl = self._btn(top, "denoise: on", self.tgl_den)
@@ -718,20 +718,43 @@ class Overlay:
         except Exception:
             pass
         if hidden:
-            self._badge("hidden-from-capture ✓")
+            self._set_state("cap", "ok", "hidden-from-capture")
         else:
-            self._badge("visible in captures", warn=True)
+            self._set_state("cap", "warn", "visible in captures")
         r.after(30, self._poll)
 
-    def _badge(self, text, warn=False):
-        ok = "✓" in text and not warn
-        warn = warn or (not ok and any(k in text for k in
-                              ("no ", "failed", "hidden", "off", "paused",
-                               "unavailable", "died", "err")))
-        bg = "#14532d" if ok else "#7f1d1d" if warn else "#243244"
-        tk.Label(self.badges, text=text, fg="#e5e7eb",
-                 bg=bg, font=("Segoe UI", 8), padx=8, pady=2
-                 ).pack(side="left", padx=(0, 4))
+    LVLCOL = {"ok": "#14532d", "warn": "#78350f", "err": "#7f1d1d",
+              "info": "#243244"}
+    DOTCOL = {"ok": "#16a34a", "warn": "#d97706", "err": "#dc2626",
+              "info": "#9ca3af"}
+    _ORDER = {"err": 3, "warn": 2, "ok": 1, "info": 0}
+
+    def _set_state(self, comp, lvl, text=""):
+        """Typed per-component status — updates the badge in place,
+        removes it on 'ok' with no text, dot shows worst level."""
+        self.state_lvl[comp] = lvl
+        lbl = self.state_lbls.get(comp)
+        if lvl == "ok" and not text:
+            if lbl is not None:
+                lbl.destroy()
+                del self.state_lbls[comp]
+        else:
+            icon = {"ok": "✓", "warn": "⚠", "err": "✗",
+                    "info": "•"}.get(lvl, "•")
+            txt = text or icon
+            if not txt.startswith(icon):
+                txt = f"{icon} {txt}"
+            if lbl is None:
+                lbl = tk.Label(self.badges, text=txt, fg="#e5e7eb",
+                               bg=self.LVLCOL.get(lvl, "#243244"),
+                               font=("Segoe UI", 8), padx=8, pady=2)
+                lbl.pack(side="left", padx=(0, 4))
+                self.state_lbls[comp] = lbl
+            else:
+                lbl.config(text=txt, bg=self.LVLCOL.get(lvl, "#243244"))
+        worst = max(self.state_lvl.values(), key=self._ORDER.get,
+                    default="ok")
+        self.dot.config(fg=self.DOTCOL.get(worst, "#16a34a"))
 
     def _btn(self, parent, text, fn):
         b = tk.Button(parent, text=text, fg=DIM, bg="#243244",
@@ -800,14 +823,10 @@ class Overlay:
         (self.mute.clear if on else self.mute.set)()
         if self.mic_active:
             self.mute_lbl.config(text="mic: on" if on else "mic: muted")
-        if not on and getattr(self, "_mute_badge", None) is None:
-            self._mute_badge = tk.Label(self.badges, text="MIC MUTED",
-                                        fg="#fca5a5", bg="#7f1d1d",
-                                        font=("Segoe UI", 8), padx=8, pady=2)
-            self._mute_badge.pack(side="left", padx=(0, 4))
-        elif on and getattr(self, "_mute_badge", None) is not None:
-            self._mute_badge.destroy()
-            self._mute_badge = None
+        if not on:
+            self._set_state("mute", "warn", "MIC MUTED")
+        else:
+            self._set_state("mute", "ok")
 
     def tgl_den(self):
         if not self.mic_active:
@@ -860,9 +879,13 @@ class Overlay:
                         self.me = "you: " + text
                 elif ev[0] == "trans":
                     self.tr = ev[1]
+                elif ev[0] == "state":
+                    self.them["now"] = ev[3] if len(ev) > 3 else ""
+                    self._set_state(ev[1], ev[2],
+                                    ev[3] if len(ev) > 3 else "")
                 elif ev[0] == "err":
                     self.them["now"] = ev[1]
-                    self._badge(f"err: {ev[1]}", warn=True)
+                    self._set_state("worker", "err", str(ev[1])[:40])
         except queue.Empty:
             pass
         except Exception:                    # one bad event must not
@@ -920,10 +943,10 @@ def main():
     ring = out_stream = None
     cands = cable_candidates()
     if not cands:
-        status.append("no VB-CABLE")
+        status.append(("cable","warn","no VB-CABLE"))
         diag("VB-CABLE not found — captions only, no mic passthrough")
     elif not cable_usable():
-        status.append("cable hidden")
+        status.append(("cable","warn","cable hidden"))
         diag("cable not visible to apps (session) — mic capture off")
     else:
         for cable_idx, cable_sr, wasapi in cands:
@@ -941,7 +964,7 @@ def main():
                     callback=lambda data, frames, t, s:
                         data.__setitem__((slice(None), 0),
                                         ring.pull(frames)), **kw)
-                status.append("cable ✓")
+                status.append(("cable","ok","cable ✓"))
                 diag(f"cable open: dev{cable_idx} "
                      f"{'wasapi+autoconv' if wasapi else 'plain'}")
                 break
@@ -949,7 +972,7 @@ def main():
                 ring = out_stream = None
                 diag(f"cable candidate {cable_idx} failed: {e}")
         if out_stream is None:
-            status.append("cable open failed")
+            status.append(("cable","err","cable open failed"))
 
     mic_q = queue.Queue(maxsize=10)      # voice path: <160ms, drop not delay
     micasr_q = queue.Queue(maxsize=64)   # ~1s of 16ms chunks
@@ -966,16 +989,16 @@ def main():
     sys.excepthook = lambda t, v, tb: diag(f"fatal: {v}")
     threading.excepthook = lambda a: (
         diag(f"thread {a.thread.name} died: {a.exc_value}"),
-        put_drop(gui_q, ("err", f"{a.thread.name} died")))
+        put_drop(gui_q, ("state", "worker", "err", f"{a.thread.name} died")))
     trans_q = queue.Queue(maxsize=4) if args.lang else None
 
     in_stream = None
     if out_stream is None:
-        status.append("mic off")
+        status.append(("mic","warn","mic off"))
     else:
         mic_idx = pick_mic()
         if mic_idx is None:
-            status.append("no mic")      # no safe input — don't open
+            status.append(("mic","warn","no mic"))
         else:
          try:
             st = sd.InputStream(
@@ -985,9 +1008,9 @@ def main():
                 callback=lambda d, f, t, s: put_drop(mic_q, d[:, 0].copy()))
             st.start()
             in_stream = st                 # assign only after start()
-            status.append("mic ✓")
+            status.append(("mic","ok","mic ✓"))
          except Exception as e:
-            status.append("no mic")
+            status.append(("mic","warn","no mic"))
             diag(f"no mic input ({e})")
     if out_stream is not None:
         out_stream.start()
@@ -1004,7 +1027,7 @@ def main():
         t.start()
         workers.append(t)
     if trans_q is not None:
-        status.append(f"trans→{args.lang}")
+        status.append(("trans","info",f"trans→{args.lang}"))
         t = threading.Thread(target=translator_worker, daemon=True,
                              args=(trans_q, gui_q, log, log_lock,
                                    lang_code(args.lang),
@@ -1012,7 +1035,7 @@ def main():
         t.start()
         workers.append(t)
 
-    status.append(model_dir.name[:30])
+    status.append(("model","info",model_dir.name[:24]))
     diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
         Overlay(gui_q, status, mute, den_off,
