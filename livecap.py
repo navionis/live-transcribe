@@ -783,12 +783,27 @@ def dead_cb(state, comp, rep, msg):
     return cb
 
 
-def _sd_reinit(state, rep, comp):
-    """PortAudio's device list is frozen at Pa_Initialize — only
-    reinit when nothing is streaming, else warn."""
-    if state.get("in") is not None or state.get("out") is not None:
-        rep.set(comp, "warn", "restart to detect new devices")
-        return False
+def _sd_reinit(state, rep):
+    """PortAudio's device list is frozen at Pa_Initialize — a reinit
+    needs every stream closed first. Dropping the live stream costs a
+    ~1s passthrough gap, but a replugged device is INVISIBLE without
+    it (frozen list returns stale indices forever). Whatever we close
+    is marked dead so the supervisor reopens it next pass."""
+    live = {"in": state.get("in"), "out": state.get("out")}
+    if live["out"] is not None:
+        state["out"], state["ring"] = None, None
+    if live["in"] is not None:
+        state["in"] = None
+    for st in live.values():
+        if st is not None:
+            try:
+                st.stop(); st.close()
+            except Exception:
+                pass
+    if live["out"] is not None:
+        mark_dead(state, "cable", rep, "cable closed for reinit")
+    if live["in"] is not None:
+        mark_dead(state, "mic", rep, "mic closed for reinit")
     try:
         sd._terminate()
         sd._initialize()
@@ -849,7 +864,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                     pass
             try:
                 idx = pick_fn()
-                if idx is None and _sd_reinit(state, rep, "mic"):
+                if idx is None and _sd_reinit(state, rep):
                     idx = pick_fn()    # re-enumerate for replugs
                 if idx is None:
                     raise RuntimeError("no mic")
@@ -865,7 +880,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
             except Exception as e:
                 fails["mic"] += 1
                 if fails["mic"] >= 3:
-                    _sd_reinit(state, rep, "mic")
+                    _sd_reinit(state, rep)
                 next_try["mic"] = now + backoff["mic"]
                 if _should_log_fail(fails["mic"]):
                     diag(f"mic reopen failed ({e}); "
@@ -895,7 +910,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
             except Exception as e:
                 fails["cable"] += 1
                 if fails["cable"] >= 3:
-                    _sd_reinit(state, rep, "cable")
+                    _sd_reinit(state, rep)
                 next_try["cable"] = now + backoff["cable"]
                 if _should_log_fail(fails["cable"]):
                     diag(f"cable reopen failed ({e}); "
@@ -1157,6 +1172,10 @@ def hotkey_worker(gui_q, tid_out=None):
                      f"err {ctypes.get_last_error()}")
         if not registered:
             return
+        # quiet chip so the chords are discoverable in-session
+        put_drop(gui_q, ("state", "hk", "info",
+                         "·".join(f"C-A-{HK[i][1]}"
+                                  for i in registered)))
         diag("hotkeys registered: "
              + ", ".join(HK[i][0] for i in registered))
         try:
@@ -1769,6 +1788,7 @@ def main():
     worker_defs = []
     hk_tid = []                    # hotkey worker's thread id — the
                                    # WM_QUIT post at shutdown needs it
+    # engine runs even when the mic/cable failed at startup — its
     # stall detector is what flags them dead and the supervisor is
     # what brings them back; the engine picks up new ring/rates from
     # `state` per chunk
