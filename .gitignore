@@ -4,4 +4,4 @@ __pycache__/
 models/
 logs/
 livecap-*.txt
-test_wavs/
+test_wavs/build/
