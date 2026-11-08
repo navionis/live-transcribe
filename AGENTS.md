@@ -49,10 +49,7 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   ceil n_out so phase stays >= 0 — a floor left it negative at
   step>1 and read future samples); `steer()` closed-loops the rate
   toward a 40ms ring fill (5ms deadband, +-0.1% cap)
-- `num_threads`: ASR = half of `os.cpu_count()`, denoiser = 1,
-  punct = `os.cpu_count()` — cpu_count on ASR AND denoiser
-  oversubscribed the box (ORT intra-op spin-waits blew the 16ms
-  denoise deadline); GTCRN is tiny and needs no parallelism
+- `num_threads = os.cpu_count()` on ASR, denoiser, punct
 - ASR provider hardcoded `cpu` — the stock sherpa-onnx pip wheel is
   CPU-only and silently falls back for other provider strings, so
   `make_recognizer` reports what the build actually has
@@ -196,9 +193,9 @@ Result: `build\livecap.dist\livecap.exe`, models beside it.
 
 ## Decisions (don't reopen without reason)
 
-- ASR = half cores, denoiser = 1 thread — replaced the earlier
-  cpu_count-everywhere decision: ORT intra-op spin-waits
-  oversubscribed cores during concurrent ASR decode
+- `num_threads = os.cpu_count()` — user asked for max-resource use;
+  a reviewer-suggested cap was tried and reverted unverified (watch
+  `slow=`/`max=` denoise stats if the 16ms deadline ever misses)
 - translation on by default (ja) — user's stated requirement
 - Esc -> double-press quit, deliberately
 
