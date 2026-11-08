@@ -13,7 +13,7 @@ $PY = ".\.venv\Scripts\python.exe"
     --include-package=soundcard --include-package-data=soundcard `
     --include-package=sounddevice `
     --include-package=deep_translator `
-    --windows-console-mode=force `
+    --windows-console-mode=disable `
     --assume-yes-for-downloads `
     --company-name=livecap --product-name=livecap --file-version=1.0.0.0 `
     --output-dir=build livecap.py
@@ -25,4 +25,4 @@ robocopy models build\livecap.dist\models /E /XF NUL CON PRN AUX /NFL /NDL /NJH 
 
 Write-Host ""
 Write-Host "built: build\livecap.dist\livecap.exe"
-Write-Host "test it from another cwd, then flip -windows-console-mode to disable"
+Write-Host "console is OFF - stderr is invisible; check badges for state"
