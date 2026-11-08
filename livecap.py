@@ -441,6 +441,13 @@ class Ring:
         with self.lock:
             self.r = self.w
 
+    def reset(self, prefill: int):
+        """Clear + refill the jitter buffer (mute and first open) —
+        an empty ring means the first bursts underrun."""
+        with self.lock:
+            self.r = self.w = 0
+        self.push(np.zeros(prefill, np.float32))
+
     def reset(self, prefill: int = 0):
         """Clear, then refill with silence — used at open and after
         unmute so the output callback always has jitter headroom."""
