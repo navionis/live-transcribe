@@ -65,16 +65,21 @@ class Resampler:
 
     def resample(self, x: np.ndarray) -> np.ndarray:
         buf = np.concatenate(([self.tail], x))
-        n_out = max(0, int((len(buf) - 1 - self.phase) / self.step))
+        last = len(buf) - 1
+        # ceil keeps phase >= 0 — with floor, step>1 (44.1k -> 16k)
+        # leaves phase negative and buf[-2] reads a sample ~16ms in
+        # the future at the head of every chunk
+        n_out = max(0, int(np.ceil((last - self.phase)
+                                   / self.step - 1e-9)))
         if n_out == 0:
             self.tail = float(buf[-1])
             self.phase -= len(x)
             return np.empty(0, np.float32)
         idx = self.phase + self.step * np.arange(n_out)
-        i = idx.astype(int)
+        i = np.clip(idx.astype(int), 0, last - 1)
         f = idx - i
         y = buf[i] * (1 - f) + buf[i + 1] * f
-        self.phase = idx[-1] + self.step - (len(buf) - 1)
+        self.phase = idx[-1] + self.step - last
         self.tail = float(buf[-1])
         return y.astype(np.float32)
 
@@ -98,6 +103,16 @@ def asr_dir() -> Path:
     if not models:
         raise SystemExit("no ASR model (with tokens.txt) under models/")
     return models[0]
+
+
+def find_asr_dir():
+    """asr_dir() that returns None instead of raising — SystemExit is
+    BaseException, not Exception, so it needs naming explicitly.
+    Lets preflight report every missing file, not just the first."""
+    try:
+        return asr_dir()
+    except (Exception, SystemExit):
+        return None
 
 
 def make_recognizer(model_dir: Path):
@@ -183,8 +198,14 @@ def _diag_writer():
     while True:
         try:
             line = _diag_q.get()
-            if sys.stderr is not None:
-                sys.stderr.write(line + "\n")
+        except Exception:
+            continue
+        try:                             # stderr can be a non-None
+            if sys.stderr is not None:   # object that raises on write
+                sys.stderr.write(line + "\n")   # (windowed build) —
+        except Exception:                # must not kill file logging
+            pass
+        try:
             f = _diag_log[0]
             if f is None:
                 continue
@@ -216,18 +237,27 @@ def diag(msg):
 
 
 def put_drop(q: queue.Queue, item):
-    """Non-blocking put; on full, drop the oldest chunk to bound latency."""
+    """Non-blocking put; on full, drop the oldest chunk to bound
+    latency. Drops are counted on the queue (q.drops) and reported to
+    the caller — silent loss is how latency bugs hide."""
+    try:
+        q.put_nowait(item)
+        return False
+    except queue.Full:
+        pass
+    dropped = False
+    try:
+        q.get_nowait()
+        dropped = True                       # evicted the oldest
+    except queue.Empty:
+        pass
     try:
         q.put_nowait(item)
     except queue.Full:
-        try:
-            q.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            q.put_nowait(item)
-        except queue.Full:
-            pass
+        dropped = True                       # item itself dropped
+    if dropped:
+        q.drops = getattr(q, "drops", 0) + 1
+    return dropped
 
 
 class Reporter:
@@ -248,6 +278,20 @@ def badge_shown(lvl: str) -> bool:
     """Only warn/err get badges — ok folds into the dot, info into the
     single compact chip, so the status row stays inside the window."""
     return lvl in ("warn", "err")
+
+
+def plan_badges(lvl_map, txt_map):
+    """State maps -> (shown_comps, hidden_count, chip_text). The badge
+    row has ~200px after the buttons, so: at most one badge (err
+    before warn, insertion order breaks ties) plus a '+N' count for
+    the rest, and the info chip hides while any err is up."""
+    errs = [c for c, l in lvl_map.items() if l == "err"]
+    warns = [c for c, l in lvl_map.items() if l == "warn"]
+    shown = (errs or warns)[:1]
+    extra = len(errs) + len(warns) - len(shown)
+    chip = "" if errs else " · ".join(
+        t for c, t in txt_map.items() if lvl_map.get(c) == "info" and t)
+    return shown, extra, chip
 
 
 def lang_code(code: str) -> str:
@@ -358,41 +402,44 @@ class Pipeline:
             return self.punct.add_punctuation_with_case(text.lower())
 
     def feed(self, samples: np.ndarray, tag: str):
-        stream = self.streams.get(tag)
-        if stream is None:
-            stream = self.streams[tag] = self.rec.create_stream()
         samples = np.ascontiguousarray(samples, dtype=np.float32)
         if not len(samples):
             return
-        stream.accept_waveform(SR, samples)
-        with self.lock:                  # one recognizer, two consumers
+        # one recognizer, two consumers — every call on it (create,
+        # decode, endpoint, result, reset) runs under the lock
+        with self.lock:
+            stream = self.streams.get(tag)
+            if stream is None:
+                stream = self.streams[tag] = self.rec.create_stream()
+            stream.accept_waveform(SR, samples)
             while self.rec.is_ready(stream):
                 self.rec.decode_stream(stream)
-        if self.rec.is_endpoint(stream):
-            text = result_text(self.rec.get_result(stream)).strip()
-            self.rec.reset(stream)
-            self.partials.pop(tag, None)
-            if text:
-                return self._punct(text)
-        else:
-            self.partials[tag] = result_text(
-                self.rec.get_result(stream)).strip()
+            if self.rec.is_endpoint(stream):
+                text = result_text(
+                    self.rec.get_result(stream)).strip()
+                self.rec.reset(stream)
+                self.partials.pop(tag, None)
+                if text:
+                    return self._punct(text)
+            else:
+                self.partials[tag] = result_text(
+                    self.rec.get_result(stream)).strip()
 
     def flush(self, tag):
         """Force-finalize one stream (per consumer); returns pending
         text or None. Padding silence is required — streaming
         transducers drop final tokens without it."""
-        stream = self.streams.get(tag)
-        if stream is None:
-            return None
-        pad = np.zeros(int(0.75 * SR), dtype=np.float32)
-        stream.accept_waveform(SR, pad)
-        stream.input_finished()
         with self.lock:                  # both consumers flush at exit
+            stream = self.streams.get(tag)
+            if stream is None:
+                return None
+            pad = np.zeros(int(0.75 * SR), dtype=np.float32)
+            stream.accept_waveform(SR, pad)
+            stream.input_finished()
             while self.rec.is_ready(stream):
                 self.rec.decode_stream(stream)
             text = result_text(self.rec.get_result(stream)).strip()
-        self.streams.pop(tag, None)
+            self.streams.pop(tag, None)
         return self._punct(text) or None
 
 
@@ -406,6 +453,7 @@ class Ring:
         self.b = np.zeros(n, np.float32)
         self.n = n
         self.r = self.w = 0
+        self.underruns = self.overruns = 0
         self.lock = threading.Lock()
 
     def push(self, x: np.ndarray):
@@ -415,6 +463,7 @@ class Ring:
             n = self.n
         with self.lock:
             if n > self.n - (self.w - self.r):   # overflow: drop oldest
+                self.overruns += 1
                 self.r += n - (self.n - (self.w - self.r))
             i = self.w % self.n
             k = min(n, self.n - i)
@@ -426,6 +475,8 @@ class Ring:
         out = np.zeros(n, np.float32)
         with self.lock:
             have = min(n, self.w - self.r)
+            if have < n:
+                self.underruns += 1
             i = self.r % self.n
             k = min(have, self.n - i)
             out[:k] = self.b[i:i + k]
@@ -440,13 +491,6 @@ class Ring:
         """Drop buffered audio — called on mute so nothing leaks out."""
         with self.lock:
             self.r = self.w
-
-    def reset(self, prefill: int):
-        """Clear + refill the jitter buffer (mute and first open) —
-        an empty ring means the first bursts underrun."""
-        with self.lock:
-            self.r = self.w = 0
-        self.push(np.zeros(prefill, np.float32))
 
     def reset(self, prefill: int = 0):
         """Clear, then refill with silence — used at open and after
@@ -482,10 +526,22 @@ def cable_candidates():
     return out
 
 
+def wasapi_default_input():
+    """The WASAPI host API's own default input. PortAudio's global
+    default on Windows is MME, and MME 'low' latency is still tens of
+    ms worse than WASAPI — so this one goes first, not sd.default."""
+    for a in sd.query_hostapis():
+        if a["name"] == "Windows WASAPI":
+            d = a["default_input_device"]
+            return d if d >= 0 else None
+    return None
+
+
 def pick_mic():
-    """Mic index: the default input first, then others — skipping
-    cable/vb-audio (feedback) and stereo mix/loopback (remote speaker's
-    audio would go out as your voice)."""
+    """Mic index: WASAPI default first, then PortAudio's default, then
+    WASAPI devices, then others — skipping cable/vb-audio (feedback)
+    and stereo mix/loopback (remote speaker's audio would go out as
+    your voice)."""
     bad = ("cable", "vb-audio", "mapper", "primary", "stereo mix",
            "loopback")
     devs = sd.query_devices()
@@ -494,9 +550,9 @@ def pick_mic():
         b in devs[i]["name"].lower() for b in bad)
     wasapi = lambda i: apis[devs[i]["hostapi"]]["name"] \
         == "Windows WASAPI"          # lower latency than the MME path
-    dflt = sd.default.device[0]
-    cands = ([dflt] if isinstance(dflt, int) and dflt >= 0 else []) \
-        + [i for i in range(len(devs)) if wasapi(i)] \
+    first = [i for i in (wasapi_default_input(), sd.default.device[0])
+             if isinstance(i, int) and i >= 0]
+    cands = first + [i for i in range(len(devs)) if wasapi(i)] \
         + list(range(len(devs)))
     return next((i for i in cands if ok(i)), None)
 
@@ -533,6 +589,25 @@ def open_cable(cands, usable, open_fn):
     return None, None, SR
 
 
+def _should_log_fail(n: int) -> bool:
+    """Bound denoise-failure diag lines: first few, then one per
+    200 — a persistent failure can't flood the 2MB log."""
+    return n <= 3 or n % 200 == 0
+
+
+def voice_stat(ring, mic_q, micasr_q, avg_ms, max_ms, slow, fails):
+    """One stderr stats line — surfaces what an average hides:
+    underruns, overruns, queue evictions, deadline misses, denoise
+    failure count."""
+    return (f"stat ring={ring.fill() if ring else 0} "
+            f"under={ring.underruns if ring else 0} "
+            f"over={ring.overruns if ring else 0} "
+            f"mic_q={mic_q.qsize()} drop={getattr(mic_q, 'drops', 0)} "
+            f"micasr={micasr_q.qsize()} "
+            f"denoise={avg_ms:.1f}ms max={max_ms:.1f}ms "
+            f"slow={slow} fails={fails}")
+
+
 def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                  mic_sr=SR, cable_sr=SR):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue."""
@@ -542,7 +617,9 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
     pend = np.empty(0, np.float32)           # native-rate accumulator
     rs = Resampler(SR, cable_sr) if ring is not None else None
     target = int(0.04 * cable_sr)            # ~40ms target ring fill
+    shift = den.frame_shift_in_samples
     stat_t, stat_dn, stat_ms = time.time(), 0, 0.0
+    stat_max = stat_slow = den_fails = 0
     while not stop.is_set():
         try:
             x = mic_q.get(timeout=0.02)
@@ -550,10 +627,10 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
             continue
         if mic_rs is not None:               # native-rate input -> 16k
             pend = np.concatenate((pend, mic_rs.resample(x)))
-            if len(pend) < den.frame_shift_in_samples:
-                continue
-            x, pend = (pend[:den.frame_shift_in_samples],
-                       pend[den.frame_shift_in_samples:])
+            n = len(pend) - len(pend) % shift
+            if not n:                        # hosts can send blocks
+                continue                     # bigger than one frame —
+            x, pend = pend[:n], pend[n:]     # drain all full frames
         try:
             if mute.is_set():                # hard mute: nothing leaves
                 needs_reset = muted = True
@@ -575,15 +652,24 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                         den.reset()          # state; a reset failure
                         needs_reset = False  # must not drop the chunk
                     out = den.run(np.ascontiguousarray(x, np.float32), SR)
-                    stat_ms += (time.monotonic() - t0) * 1000
-                    stat_dn += 1
+                    ms = (time.monotonic() - t0) * 1000
+                    stat_ms += ms
+                    stat_dn += len(x) / shift    # count 16ms frames
+                    per = ms / (len(x) / shift)  # ~ms per 16ms frame
+                    stat_max = max(stat_max, per)
+                    if per > 12:               # misses the 16ms deadline
+                        stat_slow += 1
                     y = np.asarray(out.samples, dtype=np.float32)
                     rep.set("denoise", "ok")
                 except Exception as e:       # fail open: raw chunk out
+                    den_fails += 1
                     y = np.ascontiguousarray(x, np.float32)
                     needs_reset = True
                     rep.set("denoise", "err", "bypassed: raw audio")
-                    diag(f"denoise fail: {e}")
+                    # a persistent failure must not flood the log —
+                    # first few, then one line per 200
+                    if _should_log_fail(den_fails):
+                        diag(f"denoise fail x{den_fails}: {e}")
             if not len(y):
                 continue
             if ring is not None:
@@ -593,16 +679,16 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
             put_drop(micasr_q, y)
             rep.set("mic", "ok")
             if time.time() - stat_t > 5:
-                fill = ring.fill() if ring else 0
                 if rs is not None:
                     if abs(rs.step - rs.base_step) / rs.base_step > 0.0009:
                         rep.set("cable", "err", "clock skew saturating")
                     else:
                         rep.set("cable", "ok")
-                diag(f"stat ring={fill} mic_q={mic_q.qsize()} "
-                     f"micasr={micasr_q.qsize()} "
-                     f"denoise={stat_ms/max(stat_dn,1):.1f}ms")
+                diag(voice_stat(ring, mic_q, micasr_q,
+                                stat_ms / max(stat_dn, 1), stat_max,
+                                stat_slow, den_fails))
                 stat_t, stat_dn, stat_ms = time.time(), 0, 0.0
+                stat_max = stat_slow = 0
         except Exception as e:
             rep.set("mic", "err", f"mic engine error: {e}")
 
@@ -698,7 +784,9 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
         seg = ""
         if trans_q is not None:
             trans_seq[0] += 1
-            put_drop(trans_q, (trans_seq[0], final))
+            if put_drop(trans_q, (trans_seq[0], final)):
+                with log_lock:             # eviction skips a seg too
+                    log.write("    -> (trans_q full: seg dropped)\n")
             seg = f"  [seg {trans_seq[0]}]"
         with log_lock:
             log.write(f"[{time.strftime('%H:%M:%S')}] "
@@ -807,6 +895,7 @@ class Overlay:
             vw, vh = r.winfo_screenwidth(), r.winfo_screenheight()
         x = min(max(x, vx), vx + vw - w)
         y = min(max(y, vy), vy + vh - h)
+        self._vtop = vy                # growth clamps against this
         r.geometry(f"{w}x{h}+{x}+{y}")
         pad = int(24 * self.dpi)
         mk = lambda **kw: tk.Label(r, bg=BG, anchor="w", justify="left",
@@ -871,7 +960,9 @@ class Overlay:
         if hidden:
             self._set_state("cap", "ok", "hidden-from-capture")
         else:
-            self._set_state("cap", "warn", "visible in captures")
+            # info, not warn — it isn't actionable, and an amber dot
+            # all session would cry wolf
+            self._set_state("cap", "info", "in captures")
         r.after(30, self._poll)
 
     LVLCOL = {"ok": "#14532d", "warn": "#78350f", "err": "#7f1d1d",
@@ -881,42 +972,38 @@ class Overlay:
     _ORDER = {"err": 3, "warn": 2, "ok": 1, "info": 0}
 
     def _set_state(self, comp, lvl, text=""):
-        """Typed per-component status — only warn/err get badges (the
-        rest folds into the dot), info items share one compact chip,
-        dot shows worst level."""
+        """Typed per-component status — plan_badges() picks the row
+        (one badge max + '+N', chip hidden under err); rebuilt on each
+        event since badges are few and events are deduped."""
         self.state_lvl[comp] = lvl
         self.state_txt[comp] = text
-        lbl = self.state_lbls.get(comp)
-        if badge_shown(lvl):
-            icon = "⚠" if lvl == "warn" else "✗"
-            txt = (text or icon)[:40]
-            if not txt.startswith(icon):
-                txt = f"{icon} {txt}"
-            if lbl is None:
-                lbl = tk.Label(self.badges, text=txt, fg="#e5e7eb",
-                               bg=self.LVLCOL[lvl],
-                               font=("Segoe UI", 8), padx=8, pady=2)
-                lbl.pack(side="left", padx=(0, 4))
-                self.state_lbls[comp] = lbl
-            else:
-                lbl.config(text=txt, bg=self.LVLCOL[lvl])
-        elif lbl is not None:
+        shown, extra, chip = plan_badges(self.state_lvl,
+                                         self.state_txt)
+        for lbl in self.state_lbls.values():
             lbl.destroy()
-            del self.state_lbls[comp]
-        chip = " · ".join(t for c, t in self.state_txt.items()
-                         if self.state_lvl.get(c) == "info" and t)
-        if chip:
-            if self.info_lbl is None:
-                self.info_lbl = tk.Label(
-                    self.badges, text=chip, fg="#e5e7eb",
-                    bg=self.LVLCOL["info"], font=("Segoe UI", 8),
-                    padx=8, pady=2)
-                self.info_lbl.pack(side="left", padx=(0, 4))
-            else:
-                self.info_lbl.config(text=chip)
-        elif self.info_lbl is not None:
+        self.state_lbls.clear()
+        if self.info_lbl is not None:
             self.info_lbl.destroy()
             self.info_lbl = None
+        for c in shown:
+            l = self.state_lvl[c]
+            icon = "⚠" if l == "warn" else "✗"
+            txt = (self.state_txt.get(c) or icon)[:40]
+            if not txt.startswith(icon):
+                txt = f"{icon} {txt}"
+            if extra:
+                txt += f" +{extra}"
+            lbl = tk.Label(self.badges, text=txt, fg="#e5e7eb",
+                           bg=self.LVLCOL[l],
+                           font=("Segoe UI", 8), padx=8, pady=2)
+            lbl.pack(side="left", padx=(0, 4))
+            self.state_lbls[c] = lbl
+        if chip:
+            self.info_lbl = tk.Label(
+                self.badges, text=chip, fg="#e5e7eb",
+                bg=self.LVLCOL["info"], font=("Segoe UI", 8),
+                padx=8, pady=2)
+            self.info_lbl.pack(side="left", padx=(0, 4))
         worst = max(self.state_lvl.values(), key=self._ORDER.get,
                     default="ok")
         self.dot.config(fg=self.DOTCOL.get(worst, "#16a34a"))
@@ -1070,11 +1157,15 @@ class Overlay:
             rh = self.root.winfo_reqheight()
             h0 = self.root.winfo_height()
             if rh > h0 + 2:
+                new_y = max(self._vtop,
+                            self.root.winfo_y() + h0 - rh)
                 self.root.geometry(f"{self.root.winfo_width()}x{rh}"
-                                   f"+{self.root.winfo_x()}"
-                                   f"+{self.root.winfo_y() + h0 - rh}")
+                                   f"+{self.root.winfo_x()}+{new_y}")
 
     def close(self):
+        if getattr(self, "_closed", False):   # Esc x2 + Ctrl+C can
+            return                            # both land here
+        self._closed = True
         try:
             CFG.write_text(json.dumps({
                 "x": self.root.winfo_x(), "y": self.root.winfo_y(),
@@ -1118,10 +1209,7 @@ def main():
 
     # preflight BEFORE any sherpa call — a missing file exits the
     # process silently from native code when the console is hidden
-    try:
-        model_dir = asr_dir()
-    except Exception:                      # incl. SystemExit and a
-        model_dir = None                   # missing models/ dir itself
+    model_dir = find_asr_dir()
     missing = preflight(ROOT, model_dir)
     if missing:
         raise SystemExit("missing model files:\n  "
@@ -1194,13 +1282,21 @@ def main():
          try:
             mic_sr = SR
             try:
+                kw = {}
+                apis = sd.query_hostapis()
+                if apis[sd.query_devices(mic_idx)
+                        ["hostapi"]]["name"] == "Windows WASAPI":
+                    # Windows does the SRC itself — the resampler then
+                    # never sits in the mic path
+                    kw["extra_settings"] = sd.WasapiSettings(
+                        auto_convert=True)
                 st = sd.InputStream(
                     device=mic_idx,
                     samplerate=SR, channels=1, dtype="float32",
                     latency="low",
                     blocksize=den.frame_shift_in_samples,
                     callback=lambda d, f, t, s: put_drop(
-                        mic_q, d[:, 0].copy()))
+                        mic_q, d[:, 0].copy()), **kw)
             except Exception:
                 # device rejects 16kHz (WASAPI shared) — open at its
                 # native rate; the engine resamples with the same
@@ -1224,7 +1320,16 @@ def main():
             status.append(("mic","warn","no mic"))
             diag(f"no mic input ({e})")
     if out_stream is not None:
-        out_stream.start()
+        try:
+            out_stream.start()
+        except Exception as e:         # degrade to captions-only,
+            diag(f"cable start failed: {e}")   # don't die at startup
+            try:
+                out_stream.close()
+            except Exception:
+                pass
+            out_stream = ring = None
+            status.append(("cable","err","start failed"))
     workers = []
     for tgt, name, kw in (
             (voice_engine, "voice",
@@ -1242,7 +1347,8 @@ def main():
         t.start()
         workers.append(t)
     if trans_q is not None:
-        status.append(("trans","info",f"trans→{args.lang}"))
+        # honest disclosure: captions leave the box for translation
+        status.append(("trans","info",f"{args.lang}·online"))
         t = threading.Thread(target=translator_worker, daemon=True,
                              name="trans",
                              args=(trans_q, gui_q, log, log_lock,
@@ -1251,8 +1357,7 @@ def main():
         t.start()
         workers.append(t)
 
-    status.append(("model","info",model_dir.name[:24]))
-    status.append(("log","info","logging to disk"))
+    status.append(("log","info","log"))  # model name lives in diag
     diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
         Overlay(gui_q, status, mute, den_off,

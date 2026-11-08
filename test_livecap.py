@@ -7,9 +7,11 @@ Run: .venv\\Scripts\\python.exe -m unittest test_livecap -v
 import ctypes
 import io
 import queue
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -17,6 +19,43 @@ from unittest import mock
 import numpy as np
 
 import livecap
+
+
+class ResampleDownTest(unittest.TestCase):
+    """N1 — downsampling must never read a future sample. On a ramp,
+    linear interpolation is exact, so output diffs must equal step
+    within fp error; the floor-based n_out produced a backward jump
+    at every chunk boundary."""
+
+    def _ramp_diffs(self, src, dst, chunk, nchunks):
+        rs = livecap.Resampler(src, dst)
+        x = np.arange(chunk * nchunks, dtype=np.float32)
+        outs = [rs.resample(x[i:i + chunk])
+                for i in range(0, len(x), chunk)]
+        y = np.concatenate(outs)
+        # d[1:]: the very first diff carries the initialized tail
+        # (sample -1 is unknown) — a one-time artifact, not the
+        # per-chunk-boundary glitch N1 produced
+        return np.diff(y)[1:], rs.step, y
+
+    def test_44k1_to_16k(self):
+        d, step, _ = self._ramp_diffs(44100, 16000, 705, 30)
+        self.assertTrue(np.allclose(d, step, rtol=0.01),
+                        f"max dev {np.abs(d - step).max()}")
+
+    def test_22k05_to_16k(self):
+        d, step, _ = self._ramp_diffs(22050, 16000, 706, 30)
+        self.assertTrue(np.allclose(d, step, rtol=0.01),
+                        f"max dev {np.abs(d - step).max()}")
+
+    def test_48k_to_16k(self):
+        d, step, _ = self._ramp_diffs(48000, 16000, 705, 30)
+        self.assertTrue(np.allclose(d, step, rtol=0.01),
+                        f"max dev {np.abs(d - step).max()}")
+
+    def test_total_output_count(self):
+        _, step, y = self._ramp_diffs(44100, 16000, 705, 100)
+        self.assertLess(abs(len(y) - 705 * 100 / step), 3)
 
 
 class SteerTest(unittest.TestCase):
@@ -280,6 +319,262 @@ class PreflightTest(unittest.TestCase):
             root = Path(td)
             mdir = self._full_tree(root)
             self.assertEqual(livecap.preflight(root, mdir), [])
+
+
+class FakeSD:
+    """Minimal sounddevice stand-in for pick_mic tests."""
+
+    def __init__(self, devs, default=None, wasapi_default=-1):
+        self._devs = devs
+        self._wasapi_default = wasapi_default
+        self.default = types.SimpleNamespace(device=default or (-1, -1))
+
+    def query_devices(self):
+        return self._devs
+
+    def query_hostapis(self):
+        return [{"name": "Windows MME", "default_input_device": -1},
+                {"name": "Windows WASAPI",
+                 "default_input_device": self._wasapi_default}]
+
+
+def _dev(name, hostapi, inputs=1):
+    return {"name": name, "max_input_channels": inputs,
+            "hostapi": hostapi}
+
+
+class PickMicTest(unittest.TestCase):
+    """N2 — the WASAPI host API's own default input wins over
+    PortAudio's (MME) default; rejected devices still get skipped."""
+
+    def _pick(self, devs, **kw):
+        fake = FakeSD(devs, **kw)
+        with mock.patch.object(livecap, "sd", fake):
+            return livecap.pick_mic()
+
+    def test_wasapi_default_beats_mme_default(self):
+        devs = [_dev("Microphone Array (MME)", 0),
+                _dev("Microphone (Realtek)", 1)]
+        self.assertEqual(
+            self._pick(devs, default=(0, 1), wasapi_default=1), 1)
+
+    def test_cable_wasapi_default_skipped(self):
+        devs = [_dev("CABLE Output (VB-Audio)", 1),
+                _dev("Microphone Array (MME)", 0),
+                _dev("Headset Mic (USB)", 1)]
+        # wasapi default is the cable -> rejected; MME default is
+        # PortAudio's default and wins next
+        self.assertEqual(
+            self._pick(devs, default=(1, 1), wasapi_default=0), 1)
+
+    def test_no_mic_returns_none(self):
+        devs = [_dev("CABLE Output (VB-Audio)", 1),
+                _dev("Stereo Mix", 0)]
+        self.assertIsNone(
+            self._pick(devs, default=(0, 1), wasapi_default=0))
+
+
+class DiagWriterTest(unittest.TestCase):
+    """N3 — a stderr object that raises on write must not stop the
+    file from receiving the line."""
+
+    def test_raising_stderr_still_writes_file(self):
+        buf = io.StringIO()
+        old_log, old_path = livecap._diag_log[0], livecap._diag_path[0]
+        old_err = sys.stderr
+
+        class BadErr:
+            def write(self, s):
+                raise RuntimeError("no console")
+        try:
+            livecap._diag_log[0] = buf
+            livecap._diag_size[0] = 0
+            sys.stderr = BadErr()
+            livecap.diag("n3-marker-line")
+            for _ in range(100):
+                if "n3-marker-line" in buf.getvalue():
+                    break
+                time.sleep(0.02)
+            self.assertIn("n3-marker-line", buf.getvalue())
+        finally:
+            sys.stderr = old_err
+            livecap._diag_log[0] = old_log
+            livecap._diag_path[0] = old_path
+
+
+class PlanBadgesTest(unittest.TestCase):
+    """N4 — at most one badge, err first, chip hidden under err."""
+
+    def test_chip_only_when_quiet(self):
+        lvl = {"trans": "info", "log": "info"}
+        txt = {"trans": "ja·online", "log": "log"}
+        shown, extra, chip = livecap.plan_badges(lvl, txt)
+        self.assertEqual(shown, [])
+        self.assertEqual(extra, 0)
+        self.assertEqual(chip, "ja·online · log")
+
+    def test_err_shows_badge_hides_chip(self):
+        lvl = {"trans": "info", "cable": "err"}
+        txt = {"trans": "ja·online", "cable": "failed"}
+        shown, extra, chip = livecap.plan_badges(lvl, txt)
+        self.assertEqual(shown, ["cable"])
+        self.assertEqual(chip, "")
+
+    def test_multiple_problems_counted(self):
+        lvl = {"cable": "err", "mic": "warn", "worker": "err"}
+        shown, extra, chip = livecap.plan_badges(lvl, {})
+        self.assertEqual(len(shown), 1)
+        self.assertEqual(shown[0], "cable")   # err before warn,
+        self.assertEqual(extra, 2)            # insertion order
+
+
+class DenoiseFloodTest(unittest.TestCase):
+    """N5 — 1000 failures must produce only a few diag lines."""
+
+    def test_bounded(self):
+        self.assertLessEqual(
+            sum(livecap._should_log_fail(n) for n in range(1, 1001)),
+            10)
+
+
+class FindAsrDirTest(unittest.TestCase):
+    """N6 — asr_dir's SystemExit is BaseException: must still yield
+    the full preflight list, not crash before it."""
+
+    def test_systemexit_still_preflights(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "models").mkdir()
+            (root / "models" / "gtcrn_simple.onnx").write_bytes(b"x")
+            with mock.patch.object(
+                    livecap, "asr_dir",
+                    side_effect=SystemExit("no ASR model")):
+                self.assertIsNone(livecap.find_asr_dir())
+            names = [str(m) for m in livecap.preflight(root, None)]
+            self.assertTrue(any("ASR model dir" in n for n in names))
+
+
+class PipelineLockTest(unittest.TestCase):
+    """N7 — every recognizer call runs under the decode lock."""
+
+    def test_all_calls_locked(self):
+        locked = {}
+
+        class FakeStream:
+            def accept_waveform(self, sr, s):
+                pass
+            def input_finished(self):
+                pass
+
+        class FakeRec:
+            def __init__(self):
+                self.pipe = None
+                self.ready = 1
+            def _m(self, name):
+                locked[name] = self.pipe.lock.locked()
+            def create_stream(self):
+                self._m("create_stream")
+                return FakeStream()
+            def is_ready(self, s):
+                self._m("is_ready")
+                self.ready -= 1
+                return self.ready >= 0
+            def decode_stream(self, s):
+                self._m("decode_stream")
+            def is_endpoint(self, s):
+                self._m("is_endpoint")
+                return True
+            def get_result(self, s):
+                self._m("get_result")
+                return "TEXT"
+            def reset(self, s):
+                self._m("reset")
+
+        rec = FakeRec()
+        pipe = livecap.Pipeline(rec, None)
+        rec.pipe = pipe
+        pipe.feed(np.ones(64, np.float32), "spk")
+        pipe.flush("spk")
+        for name in ("create_stream", "is_ready", "decode_stream",
+                     "is_endpoint", "get_result", "reset"):
+            self.assertTrue(locked.get(name, False),
+                            f"{name} ran unlocked")
+
+
+class RingCounterTest(unittest.TestCase):
+    """N9 — underrun/overrun counters and a stats line that shows
+    them."""
+
+    def test_counters(self):
+        r = livecap.Ring(100)
+        r.pull(10)                                # underrun
+        r.push(np.ones(90, np.float32))
+        r.push(np.ones(50, np.float32))           # overflow
+        self.assertEqual(r.underruns, 1)
+        self.assertEqual(r.overruns, 1)
+
+    def test_stat_line(self):
+        r = livecap.Ring(100)
+        r.pull(5)
+        q = queue.Queue(maxsize=1)
+        livecap.put_drop(q, "a")
+        livecap.put_drop(q, "b")                  # evicts "a"
+        mq = queue.Queue(maxsize=2)
+        s = livecap.voice_stat(r, q, mq, 2.5, 9.9, 3, 1)
+        for want in ("under=1", "drop=1", "max=9.9ms",
+                     "slow=3", "fails=1"):
+            self.assertIn(want, s)
+
+
+class PutDropTest(unittest.TestCase):
+    """Evictions are counted on the queue and reported."""
+
+    def test_counts_and_returns(self):
+        q = queue.Queue(maxsize=1)
+        self.assertFalse(livecap.put_drop(q, 1))
+        self.assertTrue(livecap.put_drop(q, 2))
+        self.assertEqual(q.drops, 1)
+
+
+class _FakeDen:
+    """Echo denoiser — returns input unchanged."""
+    frame_shift_in_samples = 256
+
+    def reset(self):
+        pass
+
+    def run(self, x, sr):
+        return types.SimpleNamespace(samples=np.asarray(x))
+
+
+class DrainFramesTest(unittest.TestCase):
+    """N10 — an oversized host block must drain ALL complete frames,
+    not just the first one."""
+
+    def test_all_frames_processed(self):
+        mic_q, micasr_q, gui_q = (queue.Queue(), queue.Queue(),
+                                  queue.Queue())
+        mute, den_off = threading.Event(), threading.Event()
+        t = threading.Thread(
+            target=livecap.voice_engine,
+            args=(mic_q, _FakeDen(), None, micasr_q, mute, den_off,
+                  gui_q),
+            kwargs=dict(mic_sr=44100), daemon=True)
+        t.start()
+        mic_q.put(np.zeros(1410, np.float32))   # ~2 frames @16k
+        time.sleep(0.4)
+        livecap.stop.set()
+        t.join(2)
+        livecap.stop.clear()
+        total = 0
+        while True:
+            try:
+                total += len(micasr_q.get_nowait())
+            except queue.Empty:
+                break
+        # 1410 * 16000/44100 = ~511 — the old code emitted ~256 and
+        # left the rest pending until the next host block
+        self.assertGreaterEqual(total, 500)
 
 
 class FatalBoxTest(unittest.TestCase):
