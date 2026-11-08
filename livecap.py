@@ -144,7 +144,7 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
         fallback = MyMemoryTranslator(source="en-US", target=lang,
                                       email=email)
     except Exception as e:
-        gui_q.put(("trans", f"[translation unavailable: {e}]"))
+        put_drop(gui_q, ("trans", f"[translation unavailable: {e}]"))
         return
     warned = False
     while not stop.is_set():
@@ -166,12 +166,12 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
                 out = None
         if out:
             warned = False
-            gui_q.put(("trans", out))
+            put_drop(gui_q, ("trans", out))
             with log_lock:
                 log.write(f"    -> {out}\n")
         elif not warned:                   # visible once, not per call
             warned = True
-            gui_q.put(("trans", "[translation paused — rate limit]"))
+            put_drop(gui_q, ("trans", "[translation paused — rate limit]"))
 
 
 # ------------------------------------------------------------------- asr
@@ -341,7 +341,7 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
             break
         tag, chunk = item
         if isinstance(chunk, tuple):      # ("err", exc) sentinel from pump
-            gui_q.put(("err", f"speaker capture failed: {chunk[1]}"))
+            put_drop(gui_q, ("err", f"speaker capture failed: {chunk[1]}"))
             continue
         final = pipe.feed(chunk, tag)
         if final:
@@ -350,14 +350,14 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
                           f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
             if trans_q is not None and tag == "spk":
                 put_drop(trans_q, final)
-            gui_q.put(("final", tag, final))
+            put_drop(gui_q, ("final", tag, final))
         elif pipe.partials.get(tag):
             p = pipe.partials[tag]
             # raw zipformer partials are ALL-CAPS — sentence-case them for
             # display (leave already-cased models like nemotron alone)
             if p.isupper():
                 p = p.capitalize()
-            gui_q.put(("partial", tag, p))
+            put_drop(gui_q, ("partial", tag, p))
     pipe.flush()
 
 
@@ -508,6 +508,12 @@ class Overlay:
             return {}
 
     def _poll(self):
+        try:
+            self.root.after(30, self._poll)   # reschedule first — a bad
+        except tk.TclError:                   # event can't stop draining
+            return
+        if stop.is_set():
+            return
         dirty = False
         try:
             while True:
@@ -533,6 +539,8 @@ class Overlay:
                     self.them["now"] = ev[1]
         except queue.Empty:
             pass
+        except Exception:                    # one bad event must not
+            pass                             # kill the drain loop
         if dirty:
             zwsp = "\u200b"
             self.them_last.config(text=self.them["last"] or zwsp)
@@ -546,8 +554,6 @@ class Overlay:
                 self.root.geometry(f"{self.root.winfo_width()}x{rh}"
                                    f"+{self.root.winfo_x()}"
                                    f"+{self.root.winfo_y()}")
-        if not stop.is_set():
-            self.root.after(30, self._poll)
 
     def close(self):
         try:
@@ -603,7 +609,8 @@ def main():
     mic_q = queue.Queue(maxsize=512)
     micasr_q = queue.Queue(maxsize=512)   # post-denoise, lowest priority
     qs = queue.Queue(maxsize=512)         # speaker, highest priority
-    gui_q = queue.Queue()
+    gui_q = queue.Queue(maxsize=1024)     # bounded — a stalled overlay
+                                          # can't eat RAM
     mute, den_off = threading.Event(), threading.Event()
     log_lock = threading.Lock()
     LOGS.mkdir(exist_ok=True)
