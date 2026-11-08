@@ -159,7 +159,9 @@ Result: `build\livecap.dist\livecap.exe`, models beside it.
 - zipformer int8 RTF ~0.5 — only model sustaining real-time;
   nemotron-0.6b RTF ~2.5 (offline use only). GTCRN RTF ~0.45
 - GTCRN: 16ms frame shift + 16ms steady-state buffer + ~2ms
-  compute/frame; mic->cable total ~45-65ms; NOIZEUS 5dB: -9 to -24dB
+  compute/frame; mic->cable total = ~40ms ring target + 16ms frame +
+  both stream latencies (see `latency=` diag lines); NOIZEUS 5dB: -9
+  to -24dB
   gap noise, 0.999 clean correlation (see denoise_file.py)
 - Captions: partials ~0.3-0.5s, finals ~1.5-1.7s after pauses
 

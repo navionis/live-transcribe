@@ -85,27 +85,31 @@ class SteerTest(unittest.TestCase):
         rs.steer(10 ** 9, 44100)
         self.assertAlmostEqual(rs.step, rs.base_step * 1.001)
 
-    def test_converges_under_skew(self):
-        """Producer at nominal 16k, consumer pulling +0.05% fast —
-        fill must settle to a stable value, not drain or pin."""
+    def _sim(self, skew, ticks=8000):
+        """Run the real Resampler+Ring against a skewed consumer."""
         sr = 44100
         ring = livecap.Ring(sr * 2)
         target = int(0.04 * sr)
         ring.reset(target)
         rs = livecap.Resampler(16000, sr)
-        pull = int(round(0.016 * sr * 1.0005))
-        fills = []
-        for _ in range(4000):               # ~64s of audio
+        pull = int(round(0.016 * sr * (1 + skew)))
+        for _ in range(ticks):
             ring.push(rs.resample(np.full(256, 0.1, np.float32)))
             ring.pull(pull)
             rs.steer(ring.fill() - target, sr)
-            fills.append(ring.fill())
-        # proportional gain leaves a bounded steady-state offset
-        # (~skew*100*sr = 50ms) — the bug was unbounded drain/pin
-        self.assertLess(abs(fills[-1] - target), int(0.08 * sr))
-        self.assertLess(np.std(fills[-500:]), int(0.005 * sr))
-        self.assertLess(
-            abs(rs.step - rs.base_step) / rs.base_step, 0.001)
+        return ring, rs, target
+
+    def test_converges_under_skew(self):
+        """P5 — integral trim: +-0.05% skew converges inside 10ms of
+        the target with zero underruns (proportional-only left a
+        ~skew*100s offset)."""
+        for skew in (0.0005, -0.0005):
+            with self.subTest(skew=skew):
+                ring, rs, target = self._sim(skew)
+                self.assertLessEqual(abs(ring.fill() - target),
+                                     int(0.01 * 44100))
+                self.assertEqual(ring.underruns, 0)
+                self.assertLessEqual(abs(rs.trim), 0.001)
 
 
 class OpenCableTest(unittest.TestCase):
@@ -329,8 +333,8 @@ class FakeSD:
         self._wasapi_default = wasapi_default
         self.default = types.SimpleNamespace(device=default or (-1, -1))
 
-    def query_devices(self):
-        return self._devs
+    def query_devices(self, idx=None):
+        return self._devs if idx is None else self._devs[idx]
 
     def query_hostapis(self):
         return [{"name": "Windows MME", "default_input_device": -1},
@@ -437,6 +441,235 @@ class DenoiseFloodTest(unittest.TestCase):
             10)
 
 
+class DiagFlushTest(unittest.TestCase):
+    """P3 — diag_flush drains the queue before teardown, and
+    exception hooks log real tracebacks."""
+
+    def _capture(self, fn):
+        buf = io.StringIO()
+        old = livecap._diag_log[0]
+        try:
+            livecap._diag_log[0] = buf
+            livecap._diag_size[0] = 0
+            fn()
+            livecap.diag_flush()
+        finally:
+            livecap._diag_log[0] = old
+        return buf.getvalue()
+
+    def test_flush_lands_lines(self):
+        out = self._capture(lambda: livecap.diag("p3-marker"))
+        self.assertIn("p3-marker", out)
+
+    def test_exc_hook_has_traceback(self):
+        def fire():
+            try:
+                raise KeyError("k")
+            except KeyError:
+                t, v, tb = sys.exc_info()
+                livecap.diag_exc("fatal", t, v, tb)
+        out = self._capture(fire)
+        self.assertIn("Traceback", out)
+        self.assertIn("KeyError", out)
+
+
+class BadgePriorityTest(unittest.TestCase):
+    """P4 — mute must not hide behind another err; order stable."""
+
+    def test_mute_wins_over_cable_err(self):
+        shown, extra, _ = livecap.plan_badges(
+            {"cable": "err", "mute": "err"}, {})
+        self.assertEqual(shown, ["mute"])
+        self.assertEqual(extra, 1)
+
+    def test_priority_order_stable(self):
+        lvl = {"speaker": "warn", "mic": "warn", "mute": "warn"}
+        shown, extra, _ = livecap.plan_badges(lvl, {})
+        self.assertEqual(shown, ["mute"])     # warns sort by
+        self.assertEqual(extra, 2)            # priority too
+
+    def test_err_beats_mute_warn(self):
+        shown, _, _ = livecap.plan_badges(
+            {"mute": "warn", "cable": "err"}, {})
+        self.assertEqual(shown, ["cable"])    # any err > any warn
+
+
+class ResetFailTest(unittest.TestCase):
+    """P2 — a raising den.reset() must not stick the engine in raw
+    bypass mode."""
+
+    def test_engine_recovers(self):
+        class Den:
+            frame_shift_in_samples = 256
+            reset_calls = 0
+            run_fails = [True]             # first run() fails once
+            def reset(self):
+                Den.reset_calls += 1
+                raise RuntimeError("reset broke")
+            def run(self, x, sr):
+                if Den.run_fails and Den.run_fails.pop():
+                    raise RuntimeError("run broke")
+                return types.SimpleNamespace(samples=np.asarray(x))
+
+        mic_q, micasr_q, gui_q = (queue.Queue(), queue.Queue(),
+                                  queue.Queue())
+        mute, den_off = threading.Event(), threading.Event()
+        t = threading.Thread(
+            target=livecap.voice_engine,
+            args=(mic_q, Den(), None, micasr_q, mute, den_off, gui_q),
+            daemon=True)
+        t.start()
+        for _ in range(3):
+            mic_q.put(np.zeros(256, np.float32))
+        time.sleep(0.4)
+        livecap.stop.set()
+        t.join(2)
+        livecap.stop.clear()
+        states = []
+        while True:
+            try:
+                states.append(gui_q.get_nowait())
+            except queue.Empty:
+                break
+        denoise = [e for e in states
+                   if e[0] == "state" and e[1] == "denoise"]
+        # reset raised but the flag cleared — engine recovered to ok
+        self.assertEqual(denoise[-1], ("state", "denoise", "ok", ""))
+
+
+class MicStallTest(unittest.TestCase):
+    """P1 — 1.5s of silence on mic_q reports an error; the next chunk
+    clears it; mute doesn't suppress."""
+
+    def _run(self, muted):
+        mic_q, micasr_q, gui_q = (queue.Queue(), queue.Queue(),
+                                  queue.Queue())
+        mute, den_off = threading.Event(), threading.Event()
+        if muted:
+            mute.set()
+        t = threading.Thread(
+            target=livecap.voice_engine,
+            args=(mic_q, _FakeDen(), None, micasr_q, mute, den_off,
+                  gui_q),
+            kwargs=dict(stall_after=0.15), daemon=True)
+        t.start()
+        time.sleep(0.35)
+        mic_q.put(np.zeros(256, np.float32))
+        time.sleep(0.15)
+        livecap.stop.set()
+        t.join(2)
+        livecap.stop.clear()
+        states = []
+        while True:
+            try:
+                states.append(gui_q.get_nowait())
+            except queue.Empty:
+                break
+        return [e for e in states
+                if e[0] == "state" and e[1] == "mic"]
+
+    def test_stall_then_recover(self):
+        evs = self._run(muted=False)
+        self.assertIn(("state", "mic", "err", "no mic input"), evs)
+        self.assertIn(("state", "mic", "ok", ""), evs)
+
+    def test_stall_reported_while_muted(self):
+        evs = self._run(muted=True)
+        self.assertIn(("state", "mic", "err", "no mic input"), evs)
+
+
+class OpenMicTest(unittest.TestCase):
+    """P6 — 16k failure is logged and the native-rate fallback still
+    carries auto_convert on WASAPI."""
+
+    def test_fallback_logged_and_wasapi(self):
+        calls = []
+
+        class SD(FakeSD):
+            class WasapiSettings:
+                def __init__(self, **kw):
+                    self.kw = kw
+            def InputStream(self, **kw):
+                calls.append(kw)
+                if kw["samplerate"] == 16000:
+                    raise RuntimeError("rate rejected")
+                return "STREAM"
+            def query_devices(self, idx=None):
+                return (self._devs if idx is None
+                        else self._devs[idx])
+
+        devs = [{"name": "Mic", "max_input_channels": 1,
+                 "hostapi": 1, "default_samplerate": 48000}]
+        fake = SD(devs)
+        den = types.SimpleNamespace(frame_shift_in_samples=256)
+        with mock.patch.object(livecap, "sd", fake), \
+                mock.patch.object(livecap, "diag") as d:
+            st, sr = livecap.open_mic(0, den, queue.Queue(),
+                                      queue.Queue())
+        self.assertEqual((st, sr), ("STREAM", 48000))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["samplerate"], 48000)
+        self.assertIn("extra_settings", calls[1])  # auto_convert kept
+        self.assertIn("finished_callback", calls[0])
+        self.assertTrue(any("16k open failed" in str(c)
+                            for c in d.call_args_list))
+
+
+class RingArmedTest(unittest.TestCase):
+    """P7 — muted/empty pulls must not count as underruns."""
+
+    def test_clear_disarms(self):
+        r = livecap.Ring(100)
+        r.pull(10)
+        r.push(np.ones(50, np.float32))
+        r.clear()
+        for _ in range(5):
+            r.pull(10)
+        self.assertEqual(r.underruns, 0)
+        r.push(np.ones(5, np.float32))
+        r.pull(10)
+        self.assertEqual(r.underruns, 1)
+
+
+class PunctOutsideLockTest(unittest.TestCase):
+    """P8 — the shared punctuator must not run under the decode
+    lock, or one stream's punctuation stalls the other's decode."""
+
+    def test_punct_runs_unlocked(self):
+        seen = {}
+
+        class FakeStream:
+            def accept_waveform(self, sr, s):
+                pass
+            def input_finished(self):
+                pass
+
+        class FakeRec:
+            pipe = None
+            def create_stream(self):
+                return FakeStream()
+            def is_ready(self, s):
+                return False
+            def is_endpoint(self, s):
+                return True
+            def get_result(self, s):
+                return "WORDS HERE"
+            def reset(self, s):
+                pass
+
+        class FakePunct:
+            def add_punctuation_with_case(self, text):
+                seen["locked"] = rec.pipe.lock.locked()
+                return "Words here."
+
+        rec = FakeRec()
+        pipe = livecap.Pipeline(rec, FakePunct())
+        rec.pipe = pipe
+        self.assertEqual(pipe.feed(np.ones(64, np.float32), "spk"),
+                         "Words here.")
+        self.assertFalse(seen["locked"])
+
+
 class FindAsrDirTest(unittest.TestCase):
     """N6 — asr_dir's SystemExit is BaseException: must still yield
     the full preflight list, not crash before it."""
@@ -507,6 +740,7 @@ class RingCounterTest(unittest.TestCase):
 
     def test_counters(self):
         r = livecap.Ring(100)
+        r.push(np.ones(5, np.float32))            # arm the counter
         r.pull(10)                                # underrun
         r.push(np.ones(90, np.float32))
         r.push(np.ones(50, np.float32))           # overflow
@@ -515,6 +749,7 @@ class RingCounterTest(unittest.TestCase):
 
     def test_stat_line(self):
         r = livecap.Ring(100)
+        r.push(np.ones(3, np.float32))
         r.pull(5)
         q = queue.Queue(maxsize=1)
         livecap.put_drop(q, "a")
