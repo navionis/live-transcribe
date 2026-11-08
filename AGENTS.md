@@ -77,8 +77,9 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   the SAME rate pair; `pick_mic()` failure is `mark_dead` too so
   hotplug recovers. Dead streams are closed and dropped from `state`
   BEFORE retry — a stale object there blocks `_sd_reinit` (device
-  re-enumeration) and replug never gets detected; warn lands on the
-  dead comp, not always `mic`
+  re-enumeration). `_sd_reinit` itself closes whatever's still live
+  and marks it dead (~1s passthrough gap) — a replugged device is
+  invisible in the frozen PortAudio list without it
 - `voice_engine` runs unconditionally — a mic/cable that failed at
   startup is reopened by the supervisor and the running engine
   consumes it (its own stall detector does the dead-marking)
@@ -127,7 +128,9 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   (`RegisterHotKey` on its own thread's queue, MOD_NOREPEAT so a
   held key can't toggle, WM_QUIT posted at shutdown) — tk `m`/`d`
   binds only fire with overlay focus, which mid-call it never has;
-  a taken chord = warn badge + diag, never fatal
+  a taken chord = warn badge + diag, never fatal. Registered chords
+  show as an info chip. NOTE: Ctrl+Alt is AltGr on some layouts —
+  the chords can collide with typed characters there (US fine)
 - `hidden` / `in captures` info chip for
   `SetWindowDisplayAffinity(hwnd, 0x11)` — info on failure too, not
   warn (an amber dot all session would cry wolf). Only blocks
