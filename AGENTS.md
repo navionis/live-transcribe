@@ -1,9 +1,10 @@
 # Workflow (required)
 
 Every change follows: **GitHub issue -> work on a branch -> commit ->
-review -> PR -> merge.** Post self-review notes on the PR before
-merging; verify the comment landed on the PR (issue/PR comment API
-shares `/issues/{n}/comments` — wrong number = wrong thread).
+review -> PR -> merge.** Submit the self-review as a real PR review —
+`POST /pulls/{n}/reviews` with `event: "COMMENT"` — NOT a plain issue
+comment (those don't count as code reviews and historically landed on
+wrong threads).
 
 - No `gh` CLI. REST API via `git credential-manager` token:
   `TOKEN=$(printf "protocol=https\nhost=github.com\n" | git credential-manager get | awk '/^password=/{sub(/^password=/,"");print}')`
