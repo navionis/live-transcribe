@@ -50,11 +50,17 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   "zipformer" and "stream" in the name (avoids offline variants);
   punct skipped for nemotron-family dirs
 - endpoint rules 2.4/1.2s trailing silence, 20s utterance cap;
-  `Pipeline.feed()` pads 0.75s silence before `input_finished()` —
+  `Pipeline.flush()` pads 0.75s silence before `input_finished()` —
   streaming transducers drop final tokens without it
-- queue `get(timeout=0.02)` (20ms); sizes: mic/micasr/qs=512,
-  trans_q=4, gui_q=1024; all puts via `put_drop` (drop-oldest) —
-  unbounded gui_q was a real RAM leak
+- queue `get(timeout=0.02)` (20ms); sizes tuned to real latency:
+  mic_q=16 (~0.25s — voice path drops, never delays), qs/micasr_q=64
+  (~2s/~1s), trans_q=4, gui_q=1024; all puts via `put_drop`
+  (drop-oldest) — unbounded gui_q was a real RAM leak
+- ring cleared on mute (`ring.clear()`) — buffered voice can't leak
+- worker loops: per-chunk try/except — one bad chunk badges err and
+  continues, thread survives
+- stats on stderr every 5s: ring fill, queue depths, denoise ms,
+  per-stream decode RTF (`stat decode spk:rtf=...`)
 
 ## Devices
 
@@ -63,11 +69,13 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - `cable_usable()`: WASAPI-level check — "CABLE Output" must appear
   in `sc.all_microphones()` (RDP sessions hide local endpoints; the
   driver exists but apps can't see it). Fails -> mic leg skipped
-- `pick_mic()`: first input not matching cable/vb-audio/mapper/
-  primary — prevents self-feedback when a virtual device is default;
-  returns None -> `no mic` badge, stream never opened
+- `pick_mic()`: default input FIRST, then others — rejects
+  cable/vb-audio (self-feedback) + stereo mix/loopback (remote
+  speaker's audio would echo back as your voice); None -> `no mic`
+  badge, stream never opened
 - `sd.OutputStream`/`sd.InputStream` open failures degrade to
-  captions-only, never crash
+  captions-only, never crash; `in_stream` assigned only after
+  `start()` succeeds (buttons can't show for a dead mic)
 
 ## Overlay
 
