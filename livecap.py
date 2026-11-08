@@ -252,9 +252,12 @@ class Ring:
 
 
 def find_cable():
-    """VB-CABLE playback endpoint 'CABLE Input' (calls read 'CABLE Output')."""
+    """VB-CABLE playback endpoint — called 'CABLE Input' or shows as a
+    'Speakers (VB-Audio Point)' output depending on Windows/driver."""
     for i, d in enumerate(sd.query_devices()):
-        if "cable input" in d["name"].lower() and d["max_output_channels"] > 0:
+        n = d["name"].lower()
+        if ("cable input" in n or "vb-audio point" in n) \
+                and d["max_output_channels"] > 0:
             return i, int(d["default_samplerate"])
     return None, None
 
