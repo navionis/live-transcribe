@@ -65,7 +65,8 @@ def make_recognizer(model_dir: Path):
     return sherpa_onnx.OnlineRecognizer.from_transducer(
         tokens=str(model_dir / "tokens.txt"),
         encoder=pick("encoder"), decoder=pick("decoder"), joiner=pick("joiner"),
-        num_threads=4, sample_rate=SR, feature_dim=80,
+        num_threads=os.cpu_count() or 4,
+        sample_rate=SR, feature_dim=80,
         enable_endpoint_detection=True,
         rule1_min_trailing_silence=2.4,
         rule2_min_trailing_silence=1.2,
@@ -77,7 +78,7 @@ def make_recognizer(model_dir: Path):
 def make_denoiser():
     cfg = sherpa_onnx.OnlineSpeechDenoiserConfig()
     cfg.model.gtcrn.model = str(ROOT / "models" / "gtcrn_simple.onnx")
-    cfg.model.num_threads = 1
+    cfg.model.num_threads = os.cpu_count() or 1
     return sherpa_onnx.OnlineSpeechDenoiser(cfg)
 
 
@@ -85,7 +86,7 @@ def make_punctuator():
     cfg = sherpa_onnx.OnlinePunctuationConfig()
     cfg.model_config.cnn_bilstm = str(PUNCT_DIR / "model.int8.onnx")
     cfg.model_config.bpe_vocab = str(PUNCT_DIR / "bpe.vocab")
-    cfg.model_config.num_threads = 1
+    cfg.model_config.num_threads = os.cpu_count() or 1
     return sherpa_onnx.OnlinePunctuation(cfg)
 
 
@@ -262,12 +263,24 @@ def find_cable():
     return None, None
 
 
+def cable_usable() -> bool:
+    """WASAPI-level check: can apps actually pick 'CABLE Output' as a
+    mic? RDP sessions hide local endpoints — PortAudio still sees the
+    cable there, but it's useless, so the mic leg gets skipped."""
+    try:
+        import soundcard as sc
+        return any("cable output" in m.name.lower()
+                   for m in sc.all_microphones())
+    except Exception:
+        return False
+
+
 def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue."""
     needs_reset = False
     while not stop.is_set():
         try:
-            x = mic_q.get(timeout=0.1)
+            x = mic_q.get(timeout=0.02)
         except queue.Empty:
             continue
         if mute.is_set():                    # hard mute: nothing leaves
@@ -329,7 +342,7 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
                 pass
         while not stop.is_set():
             try:
-                return "spk", qs.get(timeout=0.1)
+                return "spk", qs.get(timeout=0.02)
             except queue.Empty:
                 pass
             try:
@@ -372,7 +385,7 @@ CFG = LOGS / "livecap-window.json"
 
 
 class Overlay:
-    def __init__(self, gui_q, status, mute, den_off):
+    def __init__(self, gui_q, status_items, mute, den_off):
         self.q = gui_q
         self.mute, self.den_off = mute, den_off
         self.them = {"last": "", "now": ""}
@@ -393,15 +406,16 @@ class Overlay:
                                    wraplength=w - 24, **kw)
 
         top = tk.Frame(r, bg=BG)
-        top.pack(fill="x")
-        self.status = tk.Label(top, text=status, fg=ACC, bg=BG,
-                               anchor="w", font=("Segoe UI", 9))
-        self.status.pack(side="left", padx=12)
-        self.mute_lbl = self._ctl(top, "mic: on", self.tgl_mute)
-        self.den_lbl = self._ctl(top, "denoise: on", self.tgl_den)
-        self._ctl(top, "copy all", self.copy_all)
-        self._ctl(top, "copy", self.copy_last)
-        self._ctl(top, "×", self.close)
+        top.pack(fill="x", pady=(0, 2))
+        self.badges = tk.Frame(top, bg=BG)
+        self.badges.pack(side="left", padx=(10, 4))
+        for item in status_items:
+            self._badge(item)
+        self.mute_lbl = self._btn(top, "mic: on", self.tgl_mute)
+        self.den_lbl = self._btn(top, "denoise: on", self.tgl_den)
+        self._btn(top, "copy all", self.copy_all)
+        self._btn(top, "copy", self.copy_last)
+        self._btn(top, "×", self.close)
 
         self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
         self.trans = mk(fg=ACC, font=("Segoe UI", self.fs - 3))
@@ -417,7 +431,7 @@ class Overlay:
         grip.bind("<Button-1>", self._rs_down)
         grip.bind("<B1-Motion>", self._rs_move)
 
-        for wdg in (r, top, self.status, *self.text_lbls):
+        for wdg in (r, top, self.badges, *self.text_lbls):
             wdg.bind("<Button-1>", self._down)
             wdg.bind("<B1-Motion>", self._move)
         r.bind("<Escape>", lambda e: self.close())
@@ -437,15 +451,26 @@ class Overlay:
         except Exception:
             pass
         if hidden:
-            self.status.config(text=status + " · hidden-from-capture ✓")
+            self._badge("hidden-from-capture ✓")
         r.after(30, self._poll)
-        r.after(9000, lambda: self.status.config(text=""))
 
-    def _ctl(self, parent, text, fn):
-        lbl = tk.Label(parent, text=text, fg=DIM, bg=BG,
-                       font=("Segoe UI", 9), cursor="hand2")
-        lbl.pack(side="right", padx=5, pady=2)
-        lbl.bind("<Button-1>", lambda e: fn())
+    def _badge(self, text):
+        ok = "✓" in text
+        warn = not ok and any(k in text for k in
+                              ("no ", "failed", "hidden", "off", "paused",
+                               "unavailable"))
+        bg = "#14532d" if ok else "#7f1d1d" if warn else "#243244"
+        tk.Label(self.badges, text=text, fg="#e5e7eb",
+                 bg=bg, font=("Segoe UI", 8), padx=8, pady=2
+                 ).pack(side="left", padx=(0, 4))
+
+    def _btn(self, parent, text, fn):
+        b = tk.Button(parent, text=text, fg=DIM, bg="#243244",
+                      activebackground="#374151", activeforeground=TXT,
+                      bd=0, relief="flat", cursor="hand2",
+                      font=("Segoe UI", 9), padx=8, command=fn)
+        b.pack(side="right", padx=3, pady=2)
+        return b
         return lbl
 
     def _sigint(self, *_):
@@ -601,6 +626,10 @@ def main():
                       "Output' as your mic in the call app")
         print("VB-CABLE not found — captions only, no mic passthrough",
               file=sys.stderr)
+    elif not cable_usable():
+        status.append("cable hidden from apps — mic off")
+        print("cable not visible to apps (session) — mic capture off",
+              file=sys.stderr)
     else:
         try:
             ring = Ring(cable_sr // 2)  # 0.5s buffer
@@ -629,16 +658,19 @@ def main():
     trans_q = queue.Queue(maxsize=4) if args.lang else None
 
     in_stream = None
-    try:
-        in_stream = sd.InputStream(
-            samplerate=SR, channels=1, dtype="float32",
-            blocksize=den.frame_shift_in_samples,
-            callback=lambda d, f, t, s: put_drop(mic_q, d[:, 0].copy()))
-        in_stream.start()
-        status.append("mic ✓")
-    except Exception as e:
-        status.append("no mic — speaker captions only")
-        print(f"no mic input ({e})", file=sys.stderr)
+    if out_stream is None:
+        status.append("mic off — no passthrough")
+    else:
+        try:
+            in_stream = sd.InputStream(
+                samplerate=SR, channels=1, dtype="float32",
+                blocksize=den.frame_shift_in_samples,
+                callback=lambda d, f, t, s: put_drop(mic_q, d[:, 0].copy()))
+            in_stream.start()
+            status.append("mic ✓")
+        except Exception as e:
+            status.append("no mic — speaker captions only")
+            print(f"no mic input ({e})", file=sys.stderr)
     if out_stream is not None:
         out_stream.start()
     threading.Thread(target=voice_engine, daemon=True,
@@ -659,7 +691,7 @@ def main():
     print("livecap running — mic -> denoise -> cable, captions for both",
           file=sys.stderr)
     try:
-        Overlay(gui_q, " · ".join(status), mute, den_off).run()
+        Overlay(gui_q, status, mute, den_off).run()
     finally:
         stop.set()
         log.close()
