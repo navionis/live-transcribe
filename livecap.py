@@ -455,7 +455,10 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
 
 # -------------------------------------------------------- speaker -> [them]
 
-def loopback_pump(qs):
+def loopback_pump(qs, gui_q):
+    """Supervised speaker-loopback pump: re-resolves the default output
+    every ~2s, reopens on device change or recorder error (backoff),
+    and reports state — [them] can't die silently on a headset switch."""
     import ctypes
     com_init = False
     try:
@@ -464,87 +467,117 @@ def loopback_pump(qs):
         ctypes.windll.ole32.CoInitialize(None)
         com_init = True
         warnings.filterwarnings("ignore", "data discontinuity")
-        # real mics can share the speaker's name ("Remote Audio" on RDP) —
-        # match the loopback by the speaker's endpoint id, not by name
-        speaker = sc.default_speaker()
-        mic = next((m for m in sc.all_microphones(include_loopback=True)
-                    if m.isloopback and m.id == speaker.id), None)
-        if mic is None:
-            raise RuntimeError(
-                f"no loopback capture device for {speaker.name!r}")
-        with mic.recorder(samplerate=SR, channels=1) as rec:
-            while not stop.is_set():
+
+        speaker_id, rec_ctx, rec = None, None, None
+        backoff, last_check, notified = 1.0, 0.0, False
+
+        def close_rec():
+            nonlocal rec_ctx, rec
+            try:
+                if rec_ctx is not None:
+                    rec_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            rec_ctx = rec = None
+
+        while not stop.is_set():
+            try:
+                now = time.time()
+                if now - last_check > 2:
+                    last_check = now
+                    sp = sc.default_speaker()
+                    if sp.id != speaker_id:
+                        if speaker_id is not None:
+                            diag(f"speaker changed -> {sp.name}")
+                            put_drop(gui_q, ("err",
+                                             "speaker changed — reconnecting"))
+                        speaker_id = sp.id
+                        close_rec()
+                if rec is None:
+                    mic = next((m for m in sc.all_microphones(
+                        include_loopback=True)
+                        if m.isloopback and m.id == speaker_id), None)
+                    if mic is None:
+                        if not notified:
+                            put_drop(gui_q, ("err", "no speaker loopback"))
+                            notified = True
+                        time.sleep(backoff)
+                        backoff = min(backoff * 2, 5)
+                        continue
+                    rec_ctx = mic.recorder(samplerate=SR, channels=1)
+                    rec = rec_ctx.__enter__()
+                    backoff = 1.0
+                    if notified:
+                        put_drop(gui_q, ("err",
+                                         "speaker capture recovered"))
+                        notified = False
+                    diag("speaker capture ok")
                 put_drop(qs, rec.record(512)[:, 0])
+            except Exception as e:
+                close_rec()
+                if not notified:
+                    put_drop(gui_q, ("err",
+                                     f"speaker capture failed: {e}"))
+                    notified = True
+                diag(f"loopback error: {e}; retry in {backoff:.0f}s")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 5)
     except Exception as e:
         put_drop(qs, ("err", e))
     finally:
+        try:
+            close_rec()
+        except Exception:
+            pass
         if com_init:
             ctypes.windll.ole32.CoUninitialize()
 
 
 # ------------------------------------------------------------- asr consumer
 
-def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
-    def get():
-        for tag, q in (("spk", qs), ("mic", qm)):   # speaker first, always
-            try:
-                return tag, q.get_nowait()
-            except queue.Empty:
-                pass
-        while not stop.is_set():
-            try:
-                return "spk", qs.get(timeout=0.02)
-            except queue.Empty:
-                pass
-            try:
-                return "mic", qm.get_nowait()
-            except queue.Empty:
-                pass
-        return None
-
+def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None):
+    """One stream, one consumer thread — mic can't starve behind
+    speaker decode on CPU-only boxes. tag: 'spk' or 'mic'."""
     last_p = {}
-    stat = {}                            # tag -> [audio_s, decode_s]
+    stat_a = stat_d = 0.0                  # audio seconds, decode seconds
     stat_t = time.time()
     while not stop.is_set():
-        item = get()
-        if item is None:
-            break
-        tag, chunk = item
-        if isinstance(chunk, tuple):      # ("err", exc) sentinel from pump
-            put_drop(gui_q, ("err", f"speaker capture failed: {chunk[1]}"))
+        try:
+            chunk = q.get(timeout=0.02)
+        except queue.Empty:
+            continue
+        if isinstance(chunk, tuple):      # ("err", exc) from loopback
+            put_drop(gui_q, ("err",
+                             f"speaker capture failed: {chunk[1]}"))
             continue
         try:
             t0 = time.monotonic()
             final = pipe.feed(chunk, tag)
-            dt = time.monotonic() - t0
-            s = stat.setdefault(tag, [0.0, 0.0])
-            s[0] += len(chunk) / SR
-            s[1] += dt
+            stat_a += len(chunk) / SR
+            stat_d += time.monotonic() - t0
             if time.time() - stat_t > 5:
-                msg = " ".join(f"{k}:rtf={v[1]/max(v[0],0.01):.2f}"
-                               for k, v in stat.items())
-                diag(f"stat decode {msg} qs={qs.qsize()} micasr={qm.qsize()}")
-                stat_t, stat = time.time(), {}
+                diag(f"stat decode {tag}:rtf="
+                     f"{stat_d/max(stat_a,0.01):.2f} q={q.qsize()}")
+                stat_t, stat_a, stat_d = time.time(), 0.0, 0.0
             if final:
                 with log_lock:
                     log.write(f"[{time.strftime('%H:%M:%S')}] "
                               f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
-                if trans_q is not None and tag == "spk":
+                if trans_q is not None:
                     put_drop(trans_q, final)
                 put_drop(gui_q, ("final", tag, final))
                 last_p.pop(tag, None)      # reset dedup for next utterance
             elif pipe.partials.get(tag):
                 p = pipe.partials[tag]
-                # raw zipformer partials are ALL-CAPS — sentence-case them
-                # for display (leave cased models like nemotron alone)
+                # raw zipformer partials are ALL-CAPS — sentence-case
+                # them (leave cased models like nemotron alone)
                 if p.isupper():
                     p = p.capitalize()
                 if p != last_p.get(tag):   # dedupe identical partials
                     last_p[tag] = p
                     put_drop(gui_q, ("partial", tag, p))
         except Exception as e:
-            put_drop(gui_q, ("err", f"ASR decode error: {e}"))
-    pipe.flush()
+            put_drop(gui_q, ("err", f"ASR {tag} decode error: {e}"))
 
 
 # ------------------------------------------------------------------ overlay
@@ -919,10 +952,14 @@ def main():
     threading.Thread(target=voice_engine, daemon=True,
                      args=(mic_q, den, ring, cable_sr, micasr_q,
                            mute, den_off, gui_q)).start()
-    threading.Thread(target=loopback_pump, daemon=True, args=(qs,)).start()
-    threading.Thread(target=asr_consumer, daemon=True,
-                     args=(pipe, qs, micasr_q, gui_q, log, log_lock,
+    threading.Thread(target=loopback_pump, daemon=True,
+                     args=(qs, gui_q)).start()
+    threading.Thread(target=asr_consumer, name="asr-spk", daemon=True,
+                     args=(pipe, qs, gui_q, log, log_lock, "spk",
                            trans_q)).start()
+    threading.Thread(target=asr_consumer, name="asr-mic", daemon=True,
+                     args=(pipe, micasr_q, gui_q, log, log_lock,
+                           "mic")).start()
     if trans_q is not None:
         status.append(f"trans→{args.lang}")
         threading.Thread(target=translator_worker, daemon=True,
