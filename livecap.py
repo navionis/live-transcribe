@@ -602,13 +602,19 @@ def main():
         print("VB-CABLE not found — captions only, no mic passthrough",
               file=sys.stderr)
     else:
-        status.append("cable ✓")
-        ring = Ring(cable_sr // 2)  # 0.5s buffer
-        out_stream = sd.OutputStream(
-            device=cable_idx, samplerate=cable_sr, channels=1,
-            dtype="float32",
-            callback=lambda data, frames, t, s:
-                data.__setitem__((slice(None), 0), ring.pull(frames)))
+        try:
+            ring = Ring(cable_sr // 2)  # 0.5s buffer
+            out_stream = sd.OutputStream(
+                device=cable_idx, samplerate=cable_sr, channels=1,
+                dtype="float32",
+                callback=lambda data, frames, t, s:
+                    data.__setitem__((slice(None), 0), ring.pull(frames)))
+            status.append("cable ✓")
+        except Exception as e:
+            ring = out_stream = None
+            status.append(f"cable open failed ({e}) — captions only")
+            print(f"cable found but won't open ({e}) — captions only",
+                  file=sys.stderr)
 
     mic_q = queue.Queue(maxsize=512)
     micasr_q = queue.Queue(maxsize=512)   # post-denoise, lowest priority
