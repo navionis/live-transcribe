@@ -82,8 +82,8 @@ class SteerTest(unittest.TestCase):
 
     def test_cap(self):
         rs = livecap.Resampler(16000, 44100)
-        rs.steer(10 ** 9, 44100)
-        self.assertAlmostEqual(rs.step, rs.base_step * 1.001)
+        rs.steer(10 ** 9, 44100)          # trim + prop both capped
+        self.assertAlmostEqual(rs.step, rs.base_step * 1.002)
 
     def _sim(self, skew, ticks=8000):
         """Run the real Resampler+Ring against a skewed consumer."""
@@ -493,6 +493,12 @@ class BadgePriorityTest(unittest.TestCase):
             {"mute": "warn", "cable": "err"}, {})
         self.assertEqual(shown, ["cable"])    # any err > any warn
 
+    def test_cable_warn_beats_mic_warn(self):
+        # Q5: cause beats symptom — "no VB-CABLE" outranks "mic off"
+        shown, _, _ = livecap.plan_badges(
+            {"mic": "warn", "cable": "warn"}, {})
+        self.assertEqual(shown, ["cable"])
+
 
 class ResetFailTest(unittest.TestCase):
     """P2 — a raising den.reset() must not stick the engine in raw
@@ -574,8 +580,10 @@ class MicStallTest(unittest.TestCase):
         self.assertIn(("state", "mic", "ok", ""), evs)
 
     def test_stall_reported_while_muted(self):
+        # Q12: recovery "ok" must clear the badge even while muted
         evs = self._run(muted=True)
         self.assertIn(("state", "mic", "err", "no mic input"), evs)
+        self.assertIn(("state", "mic", "ok", ""), evs)
 
 
 class OpenMicTest(unittest.TestCase):
@@ -613,6 +621,103 @@ class OpenMicTest(unittest.TestCase):
         self.assertIn("finished_callback", calls[0])
         self.assertTrue(any("16k open failed" in str(c)
                             for c in d.call_args_list))
+
+
+class DropToTest(unittest.TestCase):
+    """Q1 — a latency burst drops to the target, keeping the newest
+    samples; nothing drops inside the band."""
+
+    def test_drops_to_keep(self):
+        r = livecap.Ring(1000)
+        r.push(np.arange(500, dtype=np.float32))
+        dropped = r.drop_to(200)
+        self.assertEqual(dropped, 300)
+        self.assertEqual(r.fill(), 200)
+        self.assertEqual(r.trims, 1)
+        self.assertTrue(np.array_equal(r.pull(200),
+                                       np.arange(300, 500,
+                                                 dtype=np.float32)))
+
+    def test_no_drop_inside_band(self):
+        r = livecap.Ring(1000)
+        r.push(np.ones(100, np.float32))
+        self.assertEqual(r.drop_to(200), 0)
+        self.assertEqual(r.trims, 0)
+
+
+class MaxGapTest(unittest.TestCase):
+    """Q2 — pull cadence is recorded as max_gap."""
+
+    def test_records_and_resets(self):
+        r = livecap.Ring(1000)
+        r.push(np.ones(500, np.float32))
+        times = iter([10.0, 10.01, 10.05])
+        with mock.patch.object(time, "monotonic",
+                               lambda: next(times)):
+            r.pull(10)
+            r.pull(10)
+            r.pull(10)
+        self.assertAlmostEqual(r.max_gap, 0.04)
+        r.max_gap = 0.0
+        self.assertEqual(r.max_gap, 0.0)
+
+
+class SingleInstanceTest(unittest.TestCase):
+    """Q3 — mutex already held -> False; API failure fails open."""
+
+    def test_already_running(self):
+        k = mock.Mock()
+        k.CreateMutexW.return_value = 7
+        with mock.patch.object(ctypes, "WinDLL", return_value=k), \
+                mock.patch.object(ctypes, "get_last_error",
+                                  return_value=183):
+            self.assertFalse(livecap.acquire_single_instance())
+
+    def test_exception_fails_open(self):
+        with mock.patch.object(ctypes, "WinDLL",
+                               side_effect=OSError("no kernel32")):
+            self.assertTrue(livecap.acquire_single_instance())
+
+
+class SupervisorTest(unittest.TestCase):
+    """Q4 — a dead mic is reopened with backoff and the new rate
+    lands in state."""
+
+    def test_recovers_after_failures(self):
+        ev = threading.Event()
+        state = {"in": None, "out": None, "ring": None, "mic_sr": 16000,
+                 "cable_sr": 16000, "mic_dead": True, "cable_dead": False,
+                 "ev": ev, "cands": []}
+        calls = []
+        den = types.SimpleNamespace(frame_shift_in_samples=256)
+
+        class St:
+            def start(self):
+                pass
+
+        def fake_open(i):
+            calls.append(i)
+            if len(calls) < 3:
+                raise RuntimeError("still dead")
+            return St(), 48000
+
+        gui_q = queue.Queue()
+        t = threading.Thread(
+            target=livecap.stream_supervisor,
+            args=(state, ev, gui_q, den, queue.Queue()),
+            kwargs=dict(open_mic_fn=fake_open, pick_fn=lambda: 0,
+                        base=0.01),
+            daemon=True)
+        t.start()
+        time.sleep(0.6)
+        livecap.stop.set()
+        t.join(2)
+        livecap.stop.clear()
+        self.assertEqual(len(calls), 3)          # failed twice, then won
+        self.assertFalse(state["mic_dead"])
+        self.assertEqual(state["mic_sr"], 48000)  # new rate reported
+        states = [gui_q.get_nowait() for _ in range(gui_q.qsize())]
+        self.assertIn(("state", "mic", "ok", ""), states)
 
 
 class RingArmedTest(unittest.TestCase):
