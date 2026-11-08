@@ -441,6 +441,11 @@ class Overlay:
         self.tr = ""
         self.finals = deque(maxlen=50)
         self.fs, self.alpha = 11, 0.85
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            pass
         r = self.root = tk.Tk()
         r.overrideredirect(True)
         r.attributes("-topmost", True, "-alpha", self.alpha)
@@ -495,7 +500,7 @@ class Overlay:
         for wdg in (r, top, self.badges, *self.text_lbls):
             wdg.bind("<Button-1>", self._down)
             wdg.bind("<B1-Motion>", self._move)
-        r.bind("<Escape>", lambda e: self.close())
+        r.bind("<Escape>", self._esc)
         r.bind("m", lambda e: self.tgl_mute())
         r.bind("d", lambda e: self.tgl_den())
         r.bind("c", lambda e: self.copy_last())
@@ -513,6 +518,8 @@ class Overlay:
             pass
         if hidden:
             self._badge("hidden-from-capture ✓")
+        else:
+            self._badge("visible in captures", warn=True)
         r.after(30, self._poll)
 
     def _badge(self, text, warn=False):
@@ -572,6 +579,14 @@ class Overlay:
                                                      else -0.05)))
             self.root.attributes("-alpha", self.alpha)
 
+    def _esc(self, _e=None):
+        now = time.time()
+        if getattr(self, "_esc_armed", 0) > now:
+            self.close()
+            return
+        self._esc_armed = now + 2.5
+        self.them_now.config(text="press Esc again to quit")
+
     def tgl_mute(self):
         if not self.mic_active:
             return
@@ -579,6 +594,14 @@ class Overlay:
         (self.mute.clear if on else self.mute.set)()
         if self.mic_active:
             self.mute_lbl.config(text="mic: on" if on else "mic: muted")
+        if not on and getattr(self, "_mute_badge", None) is None:
+            self._mute_badge = tk.Label(self.badges, text="MIC MUTED",
+                                        fg="#fca5a5", bg="#7f1d1d",
+                                        font=("Segoe UI", 8), padx=8, pady=2)
+            self._mute_badge.pack(side="left", padx=(0, 4))
+        elif on and getattr(self, "_mute_badge", None) is not None:
+            self._mute_badge.destroy()
+            self._mute_badge = None
 
     def tgl_den(self):
         if not self.mic_active:
