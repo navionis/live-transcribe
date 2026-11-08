@@ -48,6 +48,9 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   rate (44.1k here) via `resample_linear`
 - `num_threads = os.cpu_count()` for ASR, denoiser, punct — scales
   to the machine. Queue `get(timeout=0.02)` — 20ms max queue wait
+- ASR provider probed at startup: dml -> cuda -> cpu, printed as
+  `ASR provider: ...` — GPU used automatically when the ORT build
+  supports it (this machine runs dml)
 - endpoint rules 2.4/1.2s trailing silence, 20s utterance cap
 - flush pads 0.75s silence before `input_finished()` — without it
   streaming transducers drop final tokens
@@ -109,6 +112,18 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - GetDevice-by-ID on hidden endpoint -> fails; object doesn't exist.
 - Consequence: mic->denoise->cable->Meet chain cannot fully work in
   an RDP session; works on a local machine.
+
+## Packaging (Nuitka)
+
+- `build.ps1` — standalone folder build (--onefile optional later):
+  `powershell -ExecutionPolicy Bypass -File .\build.ps1`
+- `app_root()` resolves ROOT via `sys.argv[0]` when `__compiled__`
+  (onefile temp-extraction safety); LOGS -> `%LOCALAPPDATA%\livecap`
+  when compiled (read-only install dirs), repo `logs/` in dev
+- model copy uses `robocopy /XF NUL CON PRN AUX` — the nemotron
+  tarball contains a NUL device-name artifact that kills Copy-Item
+- console forced on for now; flip --windows-console-mode to disable
+  once stable. build/ is gitignored.
 
 ## Verified facts (6 vCPU Hyper-V, no GPU)
 
