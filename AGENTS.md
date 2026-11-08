@@ -31,6 +31,7 @@ PortAudio cb (RT)    mic -> mic_q -> voice_engine: GTCRN
 soundcard pump     loopback -> qs (highest priority)
 asr_consumer x2    one thread per stream (spk + mic) -> decode -> gui_q
 translator_worker  trans_q -> Google -> MyMemory fallback -> gui_q
+hotkey_worker      RegisterHotKey -> WM_HOTKEY -> gui_q
 main thread        tkinter Overlay, after(30ms) drains gui_q
 ```
 
@@ -74,7 +75,10 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   via `_should_log_fail`) — engine picks up new ring/rates from the
   shared `state` dict each chunk, incl. `rs` when a ring appears at
   the SAME rate pair; `pick_mic()` failure is `mark_dead` too so
-  hotplug recovers
+  hotplug recovers. Dead streams are closed and dropped from `state`
+  BEFORE retry — a stale object there blocks `_sd_reinit` (device
+  re-enumeration) and replug never gets detected; warn lands on the
+  dead comp, not always `mic`
 - `voice_engine` runs unconditionally — a mic/cable that failed at
   startup is reopened by the supervisor and the running engine
   consumes it (its own stall detector does the dead-marking)
@@ -119,6 +123,11 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - `state` events never touch the caption line — only badges/dot;
   Esc prompt lives in its own `esc_lbl`
 - MIC MUTED is a persistent red badge added/removed on toggle
+- Global Ctrl+Alt+M / Ctrl+Alt+D via `hotkey_worker`
+  (`RegisterHotKey` on its own thread's queue, MOD_NOREPEAT so a
+  held key can't toggle, WM_QUIT posted at shutdown) — tk `m`/`d`
+  binds only fire with overlay focus, which mid-call it never has;
+  a taken chord = warn badge + diag, never fatal
 - `hidden` / `in captures` info chip for
   `SetWindowDisplayAffinity(hwnd, 0x11)` — info on failure too, not
   warn (an amber dot all session would cry wolf). Only blocks
