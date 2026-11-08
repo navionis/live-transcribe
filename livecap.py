@@ -296,6 +296,14 @@ class Ring:
             self.r += have
         return out
 
+    def fill(self) -> int:
+        return self.w - self.r
+
+    def clear(self):
+        """Drop buffered audio — called on mute so nothing leaks out."""
+        with self.lock:
+            self.r = self.w
+
 
 def find_cable():
     """VB-CABLE playback endpoint — called 'CABLE Input' or shows as a
@@ -315,15 +323,18 @@ def find_cable():
 
 
 def pick_mic():
-    """Mic index; avoids cable endpoints — a virtual capture device as
-    default input would feed livecap's own output back to itself."""
-    for i, d in enumerate(sd.query_devices()):
-        n = d["name"].lower()
-        if d["max_input_channels"] > 0 and "cable" not in n \
-                and "vb-audio" not in n and "mapper" not in n \
-                and "primary" not in n:
-            return i
-    return None
+    """Mic index: the default input first, then others — skipping
+    cable/vb-audio (feedback) and stereo mix/loopback (remote speaker's
+    audio would go out as your voice)."""
+    bad = ("cable", "vb-audio", "mapper", "primary", "stereo mix",
+           "loopback")
+    devs = sd.query_devices()
+    ok = lambda i: devs[i]["max_input_channels"] > 0 and not any(
+        b in devs[i]["name"].lower() for b in bad)
+    dflt = sd.default.device[0]
+    cands = ([dflt] if isinstance(dflt, int) and dflt >= 0 else []) \
+        + list(range(len(devs)))
+    return next((i for i in cands if ok(i)), None)
 
 
 def cable_usable() -> bool:
@@ -342,31 +353,44 @@ def voice_engine(mic_q, den, ring, cable_sr, micasr_q, mute, den_off,
                  gui_q):
     """mic -> denoise -> ring buffer for cable + tap into ASR queue."""
     needs_reset = False
-    try:
-      while not stop.is_set():
+    stat_t, stat_n, stat_ms = time.time(), 0, 0.0
+    while not stop.is_set():
         try:
             x = mic_q.get(timeout=0.02)
         except queue.Empty:
             continue
-        if mute.is_set():                    # hard mute: nothing leaves
-            needs_reset = True
-            continue
-        if den_off.is_set():                 # passthrough without denoise
-            y = np.ascontiguousarray(x, np.float32)
-            needs_reset = True
-        else:
-            if needs_reset:                  # resync denoiser frame state
-                den.reset()
-                needs_reset = False
-            out = den.run(np.ascontiguousarray(x, np.float32), SR)
-            y = np.asarray(out.samples, dtype=np.float32)
-        if not len(y):
-            continue
-        if ring is not None:
-            ring.push(resample_linear(y, SR, cable_sr))
-        put_drop(micasr_q, y)
-    except Exception as e:
-        put_drop(gui_q, ("err", f"mic engine died: {e}"))
+        try:
+            if mute.is_set():                # hard mute: nothing leaves
+                needs_reset = True
+                if ring is not None:
+                    ring.clear()             # drain buffered voice too
+                continue
+            if den_off.is_set():             # passthrough without denoise
+                y = np.ascontiguousarray(x, np.float32)
+                needs_reset = True
+            else:
+                if needs_reset:              # resync denoiser frame state
+                    den.reset()
+                    needs_reset = False
+                t0 = time.monotonic()
+                out = den.run(np.ascontiguousarray(x, np.float32), SR)
+                stat_ms += (time.monotonic() - t0) * 1000
+                y = np.asarray(out.samples, dtype=np.float32)
+            if not len(y):
+                continue
+            if ring is not None:
+                ring.push(resample_linear(y, SR, cable_sr))
+            put_drop(micasr_q, y)
+            stat_n += 1
+            if time.time() - stat_t > 5:
+                fill = ring.fill() if ring else 0
+                print(f"stat ring={fill} mic_q={mic_q.qsize()} "
+                      f"micasr={micasr_q.qsize()} "
+                      f"denoise={stat_ms/max(stat_n,1):.1f}ms",
+                      file=sys.stderr)
+                stat_t, stat_n, stat_ms = time.time(), 0, 0.0
+        except Exception as e:
+            put_drop(gui_q, ("err", f"mic engine error: {e}"))
 
 
 # -------------------------------------------------------- speaker -> [them]
@@ -419,8 +443,9 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
         return None
 
     last_p = {}
-    try:
-      while not stop.is_set():
+    stat = {}                            # tag -> [audio_s, decode_s]
+    stat_t = time.time()
+    while not stop.is_set():
         item = get()
         if item is None:
             break
@@ -428,26 +453,38 @@ def asr_consumer(pipe, qs, qm, gui_q, log, log_lock, trans_q):
         if isinstance(chunk, tuple):      # ("err", exc) sentinel from pump
             put_drop(gui_q, ("err", f"speaker capture failed: {chunk[1]}"))
             continue
-        final = pipe.feed(chunk, tag)
-        if final:
-            with log_lock:
-                log.write(f"[{time.strftime('%H:%M:%S')}] "
-                          f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
-            if trans_q is not None and tag == "spk":
-                put_drop(trans_q, final)
-            put_drop(gui_q, ("final", tag, final))
-            last_p.pop(tag, None)          # reset dedup for next utterance
-        elif pipe.partials.get(tag):
-            p = pipe.partials[tag]
-            # raw zipformer partials are ALL-CAPS — sentence-case them for
-            # display (leave already-cased models like nemotron alone)
-            if p.isupper():
-                p = p.capitalize()
-            if p != last_p.get(tag):       # dedupe identical partials
-                last_p[tag] = p
-                put_drop(gui_q, ("partial", tag, p))
-    except Exception as e:
-        put_drop(gui_q, ("err", f"ASR engine died: {e}"))
+        try:
+            t0 = time.monotonic()
+            final = pipe.feed(chunk, tag)
+            dt = time.monotonic() - t0
+            s = stat.setdefault(tag, [0.0, 0.0])
+            s[0] += len(chunk) / SR
+            s[1] += dt
+            if time.time() - stat_t > 5:
+                msg = " ".join(f"{k}:rtf={v[1]/max(v[0],0.01):.2f}"
+                               for k, v in stat.items())
+                print(f"stat decode {msg} qs={qs.qsize()} micasr={qm.qsize()}",
+                      file=sys.stderr)
+                stat_t, stat = time.time(), {}
+            if final:
+                with log_lock:
+                    log.write(f"[{time.strftime('%H:%M:%S')}] "
+                              f"[{'them' if tag == 'spk' else 'you'}] {final}\n")
+                if trans_q is not None and tag == "spk":
+                    put_drop(trans_q, final)
+                put_drop(gui_q, ("final", tag, final))
+                last_p.pop(tag, None)      # reset dedup for next utterance
+            elif pipe.partials.get(tag):
+                p = pipe.partials[tag]
+                # raw zipformer partials are ALL-CAPS — sentence-case them
+                # for display (leave cased models like nemotron alone)
+                if p.isupper():
+                    p = p.capitalize()
+                if p != last_p.get(tag):   # dedupe identical partials
+                    last_p[tag] = p
+                    put_drop(gui_q, ("partial", tag, p))
+        except Exception as e:
+            put_drop(gui_q, ("err", f"ASR decode error: {e}"))
     pipe.flush()
 
 
@@ -541,7 +578,7 @@ class Overlay:
         signal.signal(signal.SIGINT, self._sigint)
         r.update_idletasks()
         # WDA_EXCLUDEFROMCAPTURE: on screen normally, invisible to
-        # screenshots and screen-share capture (Windows 10 1903+)
+        # screenshots and screen-share capture (Windows 10 2004+)
         hidden = False
         try:
             import ctypes
@@ -769,9 +806,9 @@ def main():
             print(f"cable found but won't open ({e}) — captions only",
                   file=sys.stderr)
 
-    mic_q = queue.Queue(maxsize=512)
-    micasr_q = queue.Queue(maxsize=512)   # post-denoise, lowest priority
-    qs = queue.Queue(maxsize=512)         # speaker, highest priority
+    mic_q = queue.Queue(maxsize=16)      # voice path: drop, don't delay
+    micasr_q = queue.Queue(maxsize=64)   # ~1s of 16ms chunks
+    qs = queue.Queue(maxsize=64)         # ~2s of 32ms chunks
     gui_q = queue.Queue(maxsize=1024)     # bounded — a stalled overlay
                                           # can't eat RAM
     mute, den_off = threading.Event(), threading.Event()
@@ -790,12 +827,13 @@ def main():
             status.append("no mic")      # no safe input — don't open
         else:
          try:
-            in_stream = sd.InputStream(
+            st = sd.InputStream(
                 device=mic_idx,
                 samplerate=SR, channels=1, dtype="float32",
                 blocksize=den.frame_shift_in_samples,
                 callback=lambda d, f, t, s: put_drop(mic_q, d[:, 0].copy()))
-            in_stream.start()
+            st.start()
+            in_stream = st                 # assign only after start()
             status.append("mic ✓")
          except Exception as e:
             status.append("no mic")
