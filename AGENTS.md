@@ -29,7 +29,7 @@ PortAudio cb (RT)    mic -> mic_q -> voice_engine: GTCRN
                          |-> Ring -> PortAudio out cb -> CABLE Input
                          |-> micasr_q (drop-oldest, lowest priority)
 soundcard pump     loopback -> qs (highest priority)
-asr_consumer       qs first, micasr_q second -> decode -> gui_q
+asr_consumer x2    one thread per stream (spk + mic) -> decode -> gui_q
 translator_worker  trans_q -> Google -> MyMemory fallback -> gui_q
 main thread        tkinter Overlay, after(30ms) drains gui_q
 ```
@@ -50,8 +50,10 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   step>1 and read future samples); `steer()` closed-loops the rate
   toward a 40ms ring fill (5ms deadband, +-0.1% cap)
 - `num_threads = os.cpu_count()` on ASR, denoiser, punct
-- ASR provider probed per startup: `dml -> cuda -> cpu`, printed as
-  `ASR provider: ...`; machine runs `dml`
+- ASR provider hardcoded `cpu` — the stock sherpa-onnx pip wheel is
+  CPU-only and silently falls back for other provider strings, so
+  `make_recognizer` reports what the build actually has
+  (`ASR provider: cpu`)
 - ASR = streaming zipformer int8 — `asr_dir()` prefers dirs with BOTH
   "zipformer" and "stream" in the name (avoids offline variants);
   punct skipped for nemotron-family dirs
@@ -78,8 +80,9 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 
 ## Devices
 
-- `find_cable()`: PortAudio playback endpoint matching "cable input"
-  or "vb-audio point"; prefers WASAPI hostapi, falls back to any
+- `cable_candidates()`: PortAudio playback endpoint matching "cable
+  input" or "vb-audio point"; prefers WASAPI hostapi, falls back to
+  any
 - `cable_usable()`: WASAPI-level check — "CABLE Output" must appear
   in `sc.all_microphones()` (RDP sessions hide local endpoints; the
   driver exists but apps can't see it). Fails -> mic leg skipped
@@ -98,7 +101,8 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 ## Overlay
 
 - Frameless always-on-top tkinter; DPI-aware
-  (`SetProcessDpiAwareness(2)` before Tk)
+  (`SetProcessDpiAwareness(1)` system-aware before Tk — Tk 8.6 can't
+  track per-monitor anyway)
 - Top row: at most ONE badge (err before warn, ~40 chars + `+N`
   for hidden extras) via `plan_badges`; `ok` folds into the summary
   dot (worst level wins), `info` items share one compact chip that
@@ -108,10 +112,10 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - `state` events never touch the caption line — only badges/dot;
   Esc prompt lives in its own `esc_lbl`
 - MIC MUTED is a persistent red badge added/removed on toggle
-- `hidden-from-capture ✓` badge on
-  `SetWindowDisplayAffinity(hwnd, 0x11)` success; `visible in
-  captures` warn badge on failure. Only blocks in-session capture —
-  host-side RDP screenshots still see it
+- `hidden` / `in captures` info chip for
+  `SetWindowDisplayAffinity(hwnd, 0x11)` — info on failure too, not
+  warn (an amber dot all session would cry wolf). Only blocks
+  in-session capture — host-side RDP screenshots still see it
 - **Esc requires double-press within 2.5s** (single Esc mid-call was
   a real hazard — intentional, don't "fix" it); Ctrl+C quits
 - Partials deduped via `last_p` (push only on text change; entry
