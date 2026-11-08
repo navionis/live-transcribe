@@ -63,7 +63,26 @@ def make_recognizer(model_dir: Path):
                 return str(fs[0])
         raise SystemExit(f"no {prefix}*.onnx in {model_dir}")
 
-    return sherpa_onnx.OnlineRecognizer.from_transducer(
+    provider = "cpu"
+    for cand in ("dml", "cuda"):          # GPU when the ORT build has it
+        try:
+            rec = sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=str(model_dir / "tokens.txt"),
+                encoder=pick("encoder"), decoder=pick("decoder"),
+                joiner=pick("joiner"),
+                num_threads=os.cpu_count() or 4,
+                sample_rate=SR, feature_dim=80,
+                enable_endpoint_detection=True,
+                rule1_min_trailing_silence=2.4,
+                rule2_min_trailing_silence=1.2,
+                rule3_min_utterance_length=20.0,
+                decoding_method="greedy_search", provider=cand,
+            )
+            provider = cand
+            return rec, provider
+        except Exception:
+            continue
+    rec = sherpa_onnx.OnlineRecognizer.from_transducer(
         tokens=str(model_dir / "tokens.txt"),
         encoder=pick("encoder"), decoder=pick("decoder"), joiner=pick("joiner"),
         num_threads=os.cpu_count() or 4,
@@ -72,8 +91,9 @@ def make_recognizer(model_dir: Path):
         rule1_min_trailing_silence=2.4,
         rule2_min_trailing_silence=1.2,
         rule3_min_utterance_length=20.0,
-        decoding_method="greedy_search", provider="cpu",
+        decoding_method="greedy_search", provider=provider,
     )
+    return rec, provider
 
 
 def make_denoiser():
@@ -705,7 +725,8 @@ def main():
     den = make_denoiser()
     model_dir = asr_dir()
     print(f"ASR model: {model_dir.name}", file=sys.stderr)
-    rec = make_recognizer(model_dir)
+    rec, asr_provider = make_recognizer(model_dir)
+    print(f"ASR provider: {asr_provider}", file=sys.stderr)
     punct = None if "nemotron" in model_dir.name.lower() else make_punctuator()
     pipe = Pipeline(rec, punct)
 
