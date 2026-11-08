@@ -206,10 +206,7 @@ def make_recognizer(model_dir: Path):
     kw = dict(tokens=str(model_dir / "tokens.txt"),
               encoder=pick("encoder"), decoder=pick("decoder"),
               joiner=pick("joiner"),
-              # half the cores — cpu_count on ASR AND denoiser
-              # oversubscribed the box (ORT intra-op spin-waits)
-              # and blew the 16ms denoise deadline
-              num_threads=max(1, (os.cpu_count() or 4) // 2),
+              num_threads=os.cpu_count() or 4,
               sample_rate=SR, feature_dim=80,
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
@@ -227,9 +224,7 @@ def make_recognizer(model_dir: Path):
 def make_denoiser():
     cfg = sherpa_onnx.OnlineSpeechDenoiserConfig()
     cfg.model.gtcrn.model = str(ROOT / "models" / "gtcrn_simple.onnx")
-    cfg.model.num_threads = 1        # GTCRN is tiny; extra intra-op
-                                     # threads just spin-wait on the
-                                     # 16ms deadline path
+    cfg.model.num_threads = os.cpu_count() or 1
     return sherpa_onnx.OnlineSpeechDenoiser(cfg)
 
 
