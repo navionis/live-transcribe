@@ -1368,6 +1368,7 @@ class Overlay:
         self.tr = ""
         self.seg = 0
         self.finals = deque(maxlen=50)
+        self._shown = {}                   # last text pushed per label
         self.fs, self.alpha = 11, 0.85
         _dpi_aware()
         r = self.root = tk.Tk()
@@ -1685,10 +1686,16 @@ class Overlay:
             pass                             # kill the drain loop
         if dirty:
             zwsp = "\u200b"
-            self.them_last.config(text=self.them["last"] or zwsp)
-            self.them_now.config(text=self.them["now"] or zwsp)
-            self.trans.config(text=self.tr or zwsp)
-            self.me_now.config(text=self.me or zwsp)
+            for lbl, txt in ((self.them_last, self.them["last"]),
+                             (self.them_now, self.them["now"]),
+                             (self.trans, self.tr),
+                             (self.me_now, self.me)):
+                txt = txt or zwsp
+                # config() re-lays out even for identical text —
+                # skip it when nothing changed (e.g. a badge event)
+                if self._shown.get(lbl) != txt:
+                    self._shown[lbl] = txt
+                    lbl.config(text=txt)
             # grow to fit wrapped text (never auto-shrinks) — anchored
             # at the bottom edge so growth can't leave the screen
             self.root.update_idletasks()
