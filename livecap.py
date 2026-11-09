@@ -177,9 +177,10 @@ class Resampler:
 def asr_dir() -> Path:
     models = [d for d in (ROOT / "models").iterdir()
               if (d / "tokens.txt").is_file()]
-    # zipformer is the only bundled model that sustains real-time on this cpu
-    models.sort(key=lambda d: (not ("zipformer" in d.name
-                                    and "stream" in d.name), d.name))
+    # nemotron-560ms: best WER that still sustains real-time on this
+    # cpu (RTF ~0.44 measured; the 160ms variant is ~1.4 — too slow)
+    models.sort(key=lambda d: (not ("nemotron" in d.name
+                                    and "560ms" in d.name), d.name))
     if not models:
         raise SystemExit("no ASR model (with tokens.txt) under models/")
     return models[0]
@@ -207,7 +208,9 @@ def make_recognizer(model_dir: Path):
               encoder=pick("encoder"), decoder=pick("decoder"),
               joiner=pick("joiner"),
               num_threads=os.cpu_count() or 4,
-              sample_rate=SR, feature_dim=80,
+              # nemotron uses 128 mel bins; zipformer uses 80
+              sample_rate=SR,
+              feature_dim=128 if "nemotron" in model_dir.name else 80,
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
               rule2_min_trailing_silence=1.2,
