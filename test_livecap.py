@@ -235,6 +235,58 @@ class AsrThreadsTest(unittest.TestCase):
         self.assertLessEqual(livecap.asr_threads(6, 2) * 2, 6)
 
 
+class AsrMissingTest(unittest.TestCase):
+    """asr_missing checks ONLY the ASR model — a missing gtcrn must
+    not trigger a 250MB re-download."""
+
+    def test_complete_asr_dir_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "nemotron-560ms-x"
+            d.mkdir()
+            (d / "tokens.txt").write_text("x")
+            for p in ("encoder", "decoder", "joiner"):
+                (d / f"{p}-a.onnx").write_bytes(b"x")
+            self.assertEqual(livecap.asr_missing(d), [])
+
+    def test_none_and_missing(self):
+        self.assertEqual(livecap.asr_missing(None), ["asr"])
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "x"
+            d.mkdir()
+            self.assertTrue(livecap.asr_missing(d))
+
+
+class ReinitClosesAllTest(unittest.TestCase):
+    """Pa_Terminate kills open streams — close + mark dead first."""
+
+    def test_live_streams_closed_and_marked_dead(self):
+        calls = []
+
+        class St:
+            def stop(self):
+                calls.append("stop")
+            def close(self):
+                calls.append("close")
+
+        state = {"in": St(), "out": St(), "ring": object(),
+                 "mic_dead": False, "cable_dead": False,
+                 "reinit_t": -999.0, "ev": threading.Event(),
+                 "cands": []}
+        rep = livecap.Reporter(queue.Queue())
+        with mock.patch.object(livecap.sd, "_terminate"), \
+                mock.patch.object(livecap.sd, "_initialize"), \
+                mock.patch.object(livecap, "cable_candidates",
+                                  return_value=[0]):
+            self.assertTrue(livecap._sd_reinit(state, rep))
+        self.assertEqual(calls, ["stop", "close", "stop", "close"])
+        self.assertIsNone(state["in"])
+        self.assertIsNone(state["out"])
+        self.assertIsNone(state["ring"])
+        self.assertTrue(state["mic_dead"])
+        self.assertTrue(state["cable_dead"])
+        self.assertEqual(state["cands"], [0])
+
+
 class Sha256FileTest(unittest.TestCase):
 
     def test_known_bytes(self):

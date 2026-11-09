@@ -42,6 +42,9 @@ stop = threading.Event()
 
 _single = []                                 # keeps the handle alive
 _splash = [None]
+_dl = {"mb": 0}                        # download progress — the loader
+                                       # thread writes, the pump reads
+                                       # (Tk calls are main-thread only)
 
 
 def _dpi_aware():
@@ -214,13 +217,23 @@ def sha256_file(p: Path) -> str:
     return h.hexdigest()
 
 
+def asr_missing(d):
+    """ASR-only preflight — a missing gtcrn must NOT trigger a
+    250MB model re-download (full preflight checks it too)."""
+    if d is None:
+        return ["asr"]
+    return ([p for p in ("tokens.txt",) if not (d / p).is_file()]
+            + [g for g in ("encoder*.onnx", "decoder*.onnx",
+                           "joiner*.onnx") if not list(d.glob(g))])
+
+
 def ensure_asr_model():
     """A model counts as installed only when preflight is clean —
     that way a half-extracted dir repairs itself on the next run.
     Otherwise: download (pinned SHA-256, 30s socket timeout) into a
     WRITABLE models dir, extract to a temp dir, rename each dir in."""
     try:
-        if not preflight(ROOT, find_asr_dir()):
+        if not asr_missing(find_asr_dir()):
             return                      # already installed
     except SystemExit:
         pass
@@ -240,19 +253,15 @@ def ensure_asr_model():
     tar = tmp / "m.tar.bz2"
     try:
         diag(f"downloading ASR model -> {mroot}")
-        lbl = getattr(_splash[0], "_lbl", None)
         done = 0
         with urllib.request.urlopen(ASR_TAR_URL) as r, \
                 open(tar, "wb") as f:
             while blk := r.read(1 << 20):
                 f.write(blk)
                 done += len(blk)
-                if lbl is not None:
-                    try:
-                        lbl.config(text="downloading model — "
-                                        f"{done >> 20} MB")
-                    except Exception:
-                        pass
+                _dl["mb"] = done >> 20    # pump() shows it — a Tk
+                                          # call here would throttle
+                                          # the download ~1s/config
         if sha256_file(tar) != ASR_TAR_SHA256:
             raise SystemExit("model download corrupt (sha256)")
         (tmp / "x").mkdir()
@@ -261,7 +270,9 @@ def ensure_asr_model():
                 if m.name.startswith(("/", "\\")) \
                         or ".." in m.name.split("/"):
                     raise SystemExit("unsafe member in model tar")
-            tf.extractall(tmp / "x")
+            kw = ({"filter": "data"}
+                  if hasattr(tarfile, "data_filter") else {})
+            tf.extractall(tmp / "x", **kw)
         for p in (tmp / "x").iterdir():
             shutil.rmtree(mroot / p.name, ignore_errors=True)
             p.replace(mroot / p.name)
@@ -876,27 +887,30 @@ def dead_cb(state, comp, rep, msg):
 
 
 def _sd_reinit(state, rep):
-    """PortAudio's device list is frozen at Pa_Initialize — a reinit
-    re-enumerates it. Only DEAD streams are closed; a healthy stream's
-    Pa handle is independent of the device list and keeps playing
-    through re-enumeration, so no passthrough gap."""
+    """PortAudio's device list is frozen at Pa_Initialize — and
+    Pa_Terminate kills EVERY open stream, so leaving one live hands
+    the supervisor a dangling object (a later close() can crash).
+    Close them all, mark both dead for reopen, then re-enumerate —
+    ~1s passthrough gap."""
     now = time.time()
     if now - state.get("reinit_t", 0.0) < 30.0:
         return False                 # one global cooldown: mic and cable
     state["reinit_t"] = now          # failures can't bounce each other
-    # close only streams already flagged dead — a healthy stream's
-    # Pa handle is independent of the host-API device list and keeps
-    # playing through re-enumeration (no passthrough gap)
-    for k, dead in (("in", "mic_dead"), ("out", "cable_dead")):
+    for k in ("in", "out"):
         st = state.get(k)
-        if st is not None and state.get(dead):
+        if st is not None:
+            state[k] = None
             try:
-                st.stop(); st.close()
+                st.stop()
             except Exception:
                 pass
-            state[k] = None
-            if k == "out":
-                state["ring"] = None
+            try:
+                st.close()
+            except Exception:
+                pass
+            mark_dead(state, "mic" if k == "in" else "cable", rep,
+                      "reopening")
+    state["ring"] = None
     try:
         sd._terminate()
         sd._initialize()
@@ -1091,9 +1105,9 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
     stat_t, stat_dn, stat_ms = time.time(), 0, 0.0
     stat_max = stat_slow = den_fails = 0
     last_chunk = time.time()
-    if (state or {}).get("mic_dead"):    # reopened-mic grace — no
-        last_chunk += 10                 # false "no mic input" flash
-    seen_mt = 0                        # mic_t generation marker
+    if state is not None and state["in"] is None:
+        last_chunk += 10                 # captions-only start grace —
+    seen_mt = 0                        # no false "no mic input" flash
     try:                                   # Pro Audio MMCSS class —
         import ctypes                      # priority scheduling for
         idx = ctypes.c_ulong()             # the 16ms deadline path
@@ -1143,9 +1157,12 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
             # chunks keep arriving even while muted — a stall means
             # the device is gone, not silent
             grace = (state or {}).get("mic_t", 0)
-            if time.time() - max(last_chunk, grace) > stall_after:
+            if time.time() - max(last_chunk, grace) > stall_after \
+                    and not (state or {}).get("mic_dead"):
+                # supervisor owns the badge once dead — re-reporting
+                # here every 20ms would flap "no mic input"/"retry N"
                 rep.set("mic", "err", "no mic input")
-                if state is not None and not state.get("mic_dead"):
+                if state is not None:
                     state["mic_dead"] = True    # transition only —
                     state["ev"].set()           # don't spin the wait
             continue
@@ -1384,8 +1401,8 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
     hang = 0.0                       # silent seconds still fed —
                                      # > rule2 so endpoints still fire
     floor = 0.01                     # mic EMA noise floor
-    preroll = deque(maxlen=16)       # ~250ms of recent chunks —
-                                     # fed on gate-open so onsets
+    pre, pre_n = deque(), 0          # ~250ms of SKIPPED chunks — fed
+                                     # once on gate-open so onsets
                                      # aren't clipped
 
     def emit(final):
@@ -1436,16 +1453,21 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
         thr_m = max(0.004, 3 * floor) if tag == "mic" else thr
         if rms > thr_m:
             if hang <= 0:                # gate just opened — feed
-                for c in preroll:        # the ~250ms it missed
+                for c in pre:            # the ~250ms it missed
                     f = pipe.feed(c, tag)
                     if f:
                         emit(f)
             hang = 1.5
         elif hang > 0:
             hang -= len(chunk) / SR
-        preroll.append(chunk)
         if hang <= 0 and not pipe.partials.get(tag):
+            pre.append(chunk)            # skipped chunk -> keep for
+            pre_n += len(chunk)          # the next gate-open (~0.25s
+            while pre_n > SR // 4 and len(pre) > 1:   # of pre-roll)
+                pre_n -= len(pre.popleft())
             continue
+        pre.clear()                      # a fed chunk drops the
+        pre_n = 0                        # pre-roll (fed once)
         try:
             t0 = time.monotonic()
             final = pipe.feed(chunk, tag)
@@ -1628,6 +1650,7 @@ class Overlay:
         self.dot = tk.Label(self.badges, text="●", fg="#16a34a",
                             bg=BG, font=("Segoe UI", 10))
         self.dot.pack(side="left", padx=(0, 6))
+        self.dot.bind("<Button-1>", self._list_problems)
         self.state_lbls, self.state_lvl, self.state_txt = {}, {}, {}
         self.info_lbl = None
         for comp, lvl, txt in status_items:
@@ -1724,6 +1747,7 @@ class Overlay:
                 bg=self.LVLCOL["info"], font=("Segoe UI", 8),
                 padx=8, pady=2)
             self.info_lbl.pack(side="left", padx=(0, 4))
+            self.info_lbl.bind("<Button-1>", self._list_problems)
         worst = max(self.state_lvl.values(), key=self._ORDER.get,
                     default="ok")
         self.dot.config(fg=self.DOTCOL.get(worst, "#16a34a"))
@@ -2033,7 +2057,14 @@ def main():
         rec2, _ = make_recognizer(model_dir, nth)   # 2nd instance — memory
         return den, rec, rec2                  # is cheap, CPU isn't:
     try:                                     # decode can't serialize
-        pump = (lambda: splash.update()) if splash else             (lambda: time.sleep(0.05))
+        def pump():
+            if splash:
+                if _dl["mb"]:
+                    splash._lbl.config(
+                        text=f"downloading model — {_dl['mb']} MB")
+                splash.update()
+            else:
+                time.sleep(0.05)
         den, rec, rec2 = run_with_pump(_load_models, pump)
     except BaseException:
         drop_splash()                    # splash must not outlive us
