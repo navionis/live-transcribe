@@ -36,13 +36,15 @@ def app_root() -> Path:
 
 
 ROOT = app_root()
-PUNCT_DIR = ROOT / "models" / "sherpa-onnx-online-punct-en-2024-08-06"
 SR = 16000
 
 stop = threading.Event()
 
 _single = []                                 # keeps the handle alive
 _splash = [None]
+_dl = {"mb": 0}                        # download progress — the loader
+                                       # thread writes, the pump reads
+                                       # (Tk calls are main-thread only)
 
 
 def _dpi_aware():
@@ -103,9 +105,10 @@ def loading_splash():
         x = (sp.winfo_screenwidth() - w) // 2
         y = sp.winfo_screenheight() - h - 90
         sp.geometry(f"{w}x{h}+{x}+{y}")
-        tk.Label(sp, text="livecap — loading models…",
-                 fg="#f9fafb", bg="#101418",
-                 font=("Segoe UI", 10)).pack(expand=True)
+        sp._lbl = tk.Label(sp, text="livecap — loading models…",
+                           fg="#f9fafb", bg="#101418",
+                           font=("Segoe UI", 10))
+        sp._lbl.pack(expand=True)
         sp.update()
         _splash[0] = sp
         return sp
@@ -175,14 +178,116 @@ class Resampler:
 
 
 def asr_dir() -> Path:
-    models = [d for d in (ROOT / "models").iterdir()
-              if (d / "tokens.txt").is_file()]
-    # zipformer is the only bundled model that sustains real-time on this cpu
-    models.sort(key=lambda d: (not ("zipformer" in d.name
-                                    and "stream" in d.name), d.name))
-    if not models:
-        raise SystemExit("no ASR model (with tokens.txt) under models/")
-    return models[0]
+    # kroko zipformer ONLY — feature_dim=80 is baked in, so falling
+    # back to another model would decode garbage
+    for mroot in model_dirs():
+        if not mroot.is_dir():
+            continue
+        models = [d for d in mroot.iterdir()
+                  if (d / "tokens.txt").is_file()
+                  and "kroko" in d.name]
+        if models:
+            return sorted(models)[0]
+    raise SystemExit("no kroko model dir under models/")
+
+
+ASR_TAR_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/"
+               "download/asr-models/sherpa-onnx-streaming-"
+               "zipformer-en-kroko-2025-08-06.tar.bz2")
+ASR_TAR_SHA256 = ("c8676e5ff9ac2a85296e53ee0fd4d5fb1db6770e7a76471"
+                  "66eeafe349ade6834")
+
+
+def model_dirs() -> list:
+    """ASR model search order — beside the app first; a compiled exe
+    in a read-only install dir downloads to LOCALAPPDATA instead."""
+    dirs = [ROOT / "models"]
+    la = os.environ.get("LOCALAPPDATA")
+    if la:
+        dirs.append(Path(la) / "livecap" / "models")
+    return dirs
+
+
+def sha256_file(p: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def asr_missing(d):
+    """ASR-only preflight — a missing gtcrn must NOT trigger a
+    250MB model re-download (full preflight checks it too)."""
+    if d is None:
+        return ["asr"]
+    return ([p for p in ("tokens.txt",) if not (d / p).is_file()]
+            + [g for g in ("encoder*.onnx", "decoder*.onnx",
+                           "joiner*.onnx") if not list(d.glob(g))])
+
+
+def ensure_asr_model():
+    """A model counts as installed only when preflight is clean —
+    that way a half-extracted dir repairs itself on the next run.
+    Otherwise: download (pinned SHA-256, 30s socket timeout) into a
+    WRITABLE models dir, extract to a temp dir, rename each dir in."""
+    try:
+        if not asr_missing(find_asr_dir()):
+            _dl["done"] = True
+            return                      # already installed
+    except SystemExit:
+        pass
+    import shutil, socket, tarfile, urllib.request
+    socket.setdefaulttimeout(30)
+    mroot = ROOT / "models"             # writable target — install
+    try:                                # dirs can be read-only
+        mroot.mkdir(parents=True, exist_ok=True)
+        probe = mroot / ".w"; probe.write_text("x"); probe.unlink()
+    except Exception:
+        mroot = (Path(os.environ.get("LOCALAPPDATA")
+                      or str(Path.home())) / "livecap" / "models")
+        mroot.mkdir(parents=True, exist_ok=True)
+    tmp = mroot / ".dl"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    tar = tmp / "m.tar.bz2"
+    try:
+        diag(f"downloading ASR model -> {mroot}")
+        done = 0
+        with urllib.request.urlopen(ASR_TAR_URL) as r, \
+                open(tar, "wb") as f:
+            while blk := r.read(1 << 20):
+                f.write(blk)
+                done += len(blk)
+                _dl["mb"] = done >> 20    # pump() shows it — a Tk
+                                          # call here would throttle
+                                          # the download ~1s/config
+        if sha256_file(tar) != ASR_TAR_SHA256:
+            raise SystemExit("model download corrupt (sha256)")
+        (tmp / "x").mkdir()
+        with tarfile.open(tar, "r:bz2") as tf:
+            for m in tf.getmembers():       # portable ".."/abs guard
+                if m.name.startswith(("/", "\\")) \
+                        or ".." in m.name.split("/") \
+                        or m.issym() or m.islnk():
+                    raise SystemExit("unsafe member in model tar")
+            kw = ({"filter": "data"}
+                  if hasattr(tarfile, "data_filter") else {})
+            tf.extractall(tmp / "x", **kw)
+        for p in (tmp / "x").iterdir():
+            shutil.rmtree(mroot / p.name, ignore_errors=True)
+            p.replace(mroot / p.name)
+        _dl["done"] = True
+        diag("kroko model unpacked")
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(f"model download failed: {e}\n"
+                         f"  url: {ASR_TAR_URL}\n"
+                         f"  to:  {mroot}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def find_asr_dir():
@@ -195,7 +300,13 @@ def find_asr_dir():
         return None
 
 
-def make_recognizer(model_dir: Path):
+def asr_threads(cpu: int, n: int) -> int:
+    """Split cores between recognizers — two cpu_count pools would
+    oversubscribe (each spins its own intra-op threads)."""
+    return max(1, cpu // n)
+
+
+def make_recognizer(model_dir: Path, threads: int = 0):
     def pick(prefix):
         for pat in (f"{prefix}*.int8.onnx", f"{prefix}*.onnx"):
             fs = sorted(model_dir.glob(pat))
@@ -206,8 +317,8 @@ def make_recognizer(model_dir: Path):
     kw = dict(tokens=str(model_dir / "tokens.txt"),
               encoder=pick("encoder"), decoder=pick("decoder"),
               joiner=pick("joiner"),
-              num_threads=os.cpu_count() or 4,
-              sample_rate=SR, feature_dim=80,
+              num_threads=threads or os.cpu_count() or 4,
+              sample_rate=SR, feature_dim=80,    # zipformer 80 mel bins
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
               rule2_min_trailing_silence=1.2,
@@ -224,16 +335,11 @@ def make_recognizer(model_dir: Path):
 def make_denoiser():
     cfg = sherpa_onnx.OnlineSpeechDenoiserConfig()
     cfg.model.gtcrn.model = str(ROOT / "models" / "gtcrn_simple.onnx")
-    cfg.model.num_threads = os.cpu_count() or 1
+    cfg.model.num_threads = 1        # GTCRN is tiny — intra-op
+                                     # threads just spin-wait and
+                                     # starve the ASR of real cores
     return sherpa_onnx.OnlineSpeechDenoiser(cfg)
 
-
-def make_punctuator():
-    cfg = sherpa_onnx.OnlinePunctuationConfig()
-    cfg.model_config.cnn_bilstm = str(PUNCT_DIR / "model.int8.onnx")
-    cfg.model_config.bpe_vocab = str(PUNCT_DIR / "bpe.vocab")
-    cfg.model_config.num_threads = os.cpu_count() or 1
-    return sherpa_onnx.OnlinePunctuation(cfg)
 
 
 def preflight(root: Path, model_dir):
@@ -254,11 +360,6 @@ def preflight(root: Path, model_dir):
         for pat in ("encoder*.onnx", "decoder*.onnx", "joiner*.onnx"):
             if not list(model_dir.glob(pat)):
                 missing.append(model_dir / pat)
-        if "nemotron" not in model_dir.name.lower():
-            punct = models / PUNCT_DIR.name
-            for f in ("model.int8.onnx", "bpe.vocab"):
-                if not (punct / f).is_file():
-                    missing.append(punct / f)
     return missing
 
 
@@ -378,12 +479,6 @@ class Reporter:
                 put_drop(self.q, ("state", comp, lvl, msg))
 
 
-def badge_shown(lvl: str) -> bool:
-    """Only warn/err get badges — ok folds into the dot, info into the
-    single compact chip, so the status row stays inside the window."""
-    return lvl in ("warn", "err")
-
-
 _BADGE_PRIORITY = ("mute", "cable", "mic", "speaker")
 
 
@@ -468,7 +563,9 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
             sid, text = tq.get(timeout=0.1)
         except queue.Empty:
             continue
-        while True:                        # keep only the newest segment
+        # scrollback keeps every segment — a skipped one is a
+        # permanent gap, so only skip under a real backlog
+        while tq.qsize() > 3:
             try:
                 item = tq.get_nowait()
                 with log_lock:             # name the dropped seg id
@@ -502,19 +599,11 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
 # ------------------------------------------------------------------- asr
 
 class Pipeline:
-    def __init__(self, recognizer, punct):
+    def __init__(self, recognizer):
         self.rec = recognizer
-        self.punct = punct
         self.streams = {}
         self.partials = {}
         self.lock = threading.Lock()   # serialize decode across streams
-        self.plock = threading.Lock()  # shared punctuator isn't mt-safe
-
-    def _punct(self, text: str) -> str:
-        if not self.punct or not text:
-            return text
-        with self.plock:
-            return self.punct.add_punctuation_with_case(text.lower())
 
     def feed(self, samples: np.ndarray, tag: str):
         samples = np.ascontiguousarray(samples, dtype=np.float32)
@@ -528,20 +617,19 @@ class Pipeline:
             if stream is None:
                 stream = self.streams[tag] = self.rec.create_stream()
             stream.accept_waveform(SR, samples)
-            while self.rec.is_ready(stream):
-                self.rec.decode_stream(stream)
+            ran = False                  # get_result builds a string
+            while self.rec.is_ready(stream):   # — only pay for it
+                self.rec.decode_stream(stream)  # when decode ran or
+                ran = True                      # an endpoint fired
             if self.rec.is_endpoint(stream):
                 text = result_text(
                     self.rec.get_result(stream)).strip()
                 self.rec.reset(stream)
                 self.partials.pop(tag, None)
-            else:
+            elif ran:
                 self.partials[tag] = result_text(
                     self.rec.get_result(stream)).strip()
-        # punctuation is slow and has its own lock — holding the decode
-        # lock through it would stall the other stream
-        if text:
-            return self._punct(text)
+        return text or None
 
     def flush(self, tag):
         """Force-finalize one stream (per consumer); returns pending
@@ -551,14 +639,14 @@ class Pipeline:
             stream = self.streams.get(tag)
             if stream is None:
                 return None
-            pad = np.zeros(int(0.75 * SR), dtype=np.float32)
+            pad = np.zeros(int(1.0 * SR), dtype=np.float32)
             stream.accept_waveform(SR, pad)
             stream.input_finished()
             while self.rec.is_ready(stream):
                 self.rec.decode_stream(stream)
             text = result_text(self.rec.get_result(stream)).strip()
             self.streams.pop(tag, None)
-        return self._punct(text) or None
+        return text or None
 
 
 # ------------------------------------------------------ mic -> denoise ->
@@ -801,31 +889,57 @@ def dead_cb(state, comp, rep, msg):
     return cb
 
 
+def dev_sig():
+    """Device-set signature — soundcard needs COM on the calling
+    thread. Reinit only matters when the OS device set changed;
+    comparing before/after kills the 30s reinit bounce."""
+    import ctypes
+    ci = False
+    try:
+        ctypes.windll.ole32.CoInitialize(None)
+        ci = True
+    except Exception:
+        pass
+    try:
+        import soundcard as sc
+        return (frozenset(m.id for m in sc.all_microphones())
+                | frozenset(s.id for s in sc.all_speakers()))
+    except Exception:
+        return None
+    finally:
+        if ci:
+            ctypes.windll.ole32.CoUninitialize()
+
+
 def _sd_reinit(state, rep):
-    """PortAudio's device list is frozen at Pa_Initialize — a reinit
-    needs every stream closed first. Dropping the live stream costs a
-    ~1s passthrough gap, but a replugged device is INVISIBLE without
-    it (frozen list returns stale indices forever). Whatever we close
-    is marked dead so the supervisor reopens it next pass."""
+    """PortAudio's device list is frozen at Pa_Initialize — and
+    Pa_Terminate kills EVERY open stream, so leaving one live hands
+    the supervisor a dangling object (a later close() can crash).
+    Close them all, mark both dead for reopen, then re-enumerate —
+    ~1s passthrough gap."""
     now = time.time()
     if now - state.get("reinit_t", 0.0) < 30.0:
         return False                 # one global cooldown: mic and cable
     state["reinit_t"] = now          # failures can't bounce each other
-    live = {"in": state.get("in"), "out": state.get("out")}
-    if live["out"] is not None:
-        state["out"], state["ring"] = None, None
-    if live["in"] is not None:
-        state["in"] = None
-    for st in live.values():
+    sig = dev_sig()                  # an unchanged device set means a
+    if sig is not None and sig == state.get("sig"):   # reinit can't
+        return False                 # help — don't bounce streams
+    state["sig"] = sig
+    for k in ("in", "out"):
+        st = state.get(k)
         if st is not None:
+            state[k] = None
             try:
-                st.stop(); st.close()
+                st.stop()
             except Exception:
                 pass
-    if live["out"] is not None:
-        mark_dead(state, "cable", rep, "cable closed for reinit")
-    if live["in"] is not None:
-        mark_dead(state, "mic", rep, "mic closed for reinit")
+            try:
+                st.close()
+            except Exception:
+                pass
+            mark_dead(state, "mic" if k == "in" else "cable", rep,
+                      "reopening")
+    state["ring"] = None
     try:
         sd._terminate()
         sd._initialize()
@@ -914,7 +1028,14 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 if idx is None:
                     raise RuntimeError("no mic")
                 st, msr = open_mic_fn(idx)
-                st.start()
+                try:
+                    st.start()
+                except Exception:
+                    try:               # a failed start leaks the
+                        st.close()     # stream handle — close it
+                    except Exception:
+                        pass
+                    raise
                 state["in"] = st
                 state["mic_sr"], state["mic_dead"] = msr, False
                 state["mic_t"] = time.time()   # grace before stall
@@ -924,6 +1045,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 diag(f"mic reopened: dev{idx} {msr}Hz")
             except Exception as e:
                 fails["mic"] += 1
+                rep.set("mic", "err", f"retry {fails['mic']}")
                 if fails["mic"] >= 3:
                     _sd_reinit(state, rep)
                 next_try["mic"] = now + backoff["mic"]
@@ -943,7 +1065,14 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 ring2, st2, csr = open_cable_fn()
                 if st2 is None:
                     raise RuntimeError("all cable candidates failed")
-                st2.start()
+                try:
+                    st2.start()
+                except Exception:
+                    try:
+                        st2.close()
+                    except Exception:
+                        pass
+                    raise
                 state["out"] = st2
                 state["ring"], state["cable_sr"] = ring2, csr
                 state["cable_dead"] = False
@@ -954,6 +1083,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 diag(f"cable reopened: {csr}Hz")
             except Exception as e:
                 fails["cable"] += 1
+                rep.set("cable", "err", f"retry {fails['cable']}")
                 if fails["cable"] >= 3:
                     _sd_reinit(state, rep)
                 next_try["cable"] = now + backoff["cable"]
@@ -1004,7 +1134,16 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
     stat_t, stat_dn, stat_ms = time.time(), 0, 0.0
     stat_max = stat_slow = den_fails = 0
     last_chunk = time.time()
-    seen_mt = 0                        # mic_t generation marker
+    if state is not None and state["in"] is None:
+        last_chunk += 10                 # captions-only start grace —
+    seen_mt = 0                        # no false "no mic input" flash
+    try:                                   # Pro Audio MMCSS class —
+        import ctypes                      # priority scheduling for
+        idx = ctypes.c_ulong()             # the 16ms deadline path
+        ctypes.windll.avrt.AvSetMmThreadCharacteristicsW(
+            "Pro Audio", ctypes.byref(idx))
+    except Exception:
+        pass
     while not stop.is_set():
         if state is not None:                # supervisor may have
             ring = state["ring"]             # swapped these on reopen
@@ -1042,14 +1181,19 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
         try:
             x = mic_q.get(timeout=0.02)
             last_chunk = time.time()
-            rep.set("mic", "ok")             # Q12: recovery clears
+            if not (state or {}).get("mic_dead"):
+                rep.set("mic", "ok")         # stale pre-death chunks
+                                             # must not clear badges
         except queue.Empty:                  # the badge even muted
             # chunks keep arriving even while muted — a stall means
             # the device is gone, not silent
             grace = (state or {}).get("mic_t", 0)
-            if time.time() - max(last_chunk, grace) > stall_after:
+            if time.time() - max(last_chunk, grace) > stall_after \
+                    and not (state or {}).get("mic_dead"):
+                # supervisor owns the badge once dead — re-reporting
+                # here every 20ms would flap "no mic input"/"retry N"
                 rep.set("mic", "err", "no mic input")
-                if state is not None and not state.get("mic_dead"):
+                if state is not None:
                     state["mic_dead"] = True    # transition only —
                     state["ev"].set()           # don't spin the wait
             continue
@@ -1123,7 +1267,7 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                     if abs(rs.trim) > 0.0009 and abs(
                             ring.fill() - target) > 0.01 * cur_sr[1]:
                         rep.set("cable", "err", "clock skew saturating")
-                    else:
+                    elif not (state or {}).get("cable_dead"):
                         rep.set("cable", "ok")
                 diag(voice_stat(ring, mic_q, micasr_q,
                                 stat_ms / max(stat_dn, 1), stat_max,
@@ -1190,7 +1334,9 @@ def loopback_pump(qs, gui_q):
                     backoff = 1.0
                     rep.set("speaker", "ok")
                     diag("speaker capture ok")
-                put_drop(qs, rec.record(512)[:, 0])
+                put_drop(qs, rec.record(1600)[:, 0])   # 100ms chunks —
+                # the model decodes in blocks anyway; 6x fewer
+                # Python round-trips through the pump
             except Exception as e:
                 close_rec()
                 rep.set("speaker", "err", f"capture failed: {e}")
@@ -1210,7 +1356,7 @@ def loopback_pump(qs, gui_q):
 
 # ----------------------------------------------------------------- hotkeys
 
-def hotkey_worker(gui_q, tid_out=None):
+def hotkey_worker(gui_q, mute=None, den_off=None, tid_out=None):
     """Global hotkeys — tk bind() only fires while the overlay has
     focus, which mid-call it never does. RegisterHotKey(NULL hwnd)
     posts WM_HOTKEY to THIS thread's queue; a GetMessage loop drains
@@ -1242,10 +1388,6 @@ def hotkey_worker(gui_q, tid_out=None):
                      f"err {ctypes.get_last_error()}")
         if not registered:
             return
-        # quiet chip so the chords are discoverable in-session
-        put_drop(gui_q, ("state", "hk", "info",
-                         "·".join(f"C-A-{HK[i][1]}"
-                                  for i in registered)))
         diag("hotkeys registered: "
              + ", ".join(HK[i][0] for i in registered))
         try:
@@ -1254,7 +1396,13 @@ def hotkey_worker(gui_q, tid_out=None):
                 if msg.message == WM_HOTKEY:
                     hk = HK.get(msg.wParam)
                     if hk:
-                        put_drop(gui_q, ("hotkey", hk[0]))
+                        # flip the flag HERE — the overlay only syncs
+                        # its labels, so a dead Tk can't leave state
+                        # and UI disagreeing
+                        ev = {"mute": mute, "den": den_off}.get(hk[0])
+                        if ev is not None:
+                            (ev.clear if ev.is_set() else ev.set)()
+                        put_drop(gui_q, ("sync", hk[0]))
         finally:
             for hkid in registered:
                 u.UnregisterHotKey(None, hkid)
@@ -1269,11 +1417,24 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
     """One stream, one consumer thread — mic can't starve behind
     speaker decode on CPU-only boxes. tag: 'spk' or 'mic'."""
     rep = Reporter(gui_q)
+    try:                               # decode yields to the audio
+        import ctypes                  # threads — BELOW_NORMAL
+        ctypes.windll.kernel32.SetThreadPriority(
+            ctypes.windll.kernel32.GetCurrentThread(), -1)
+    except Exception:
+        pass
     last_p = {}
     stat_a = stat_d = 0.0                  # audio seconds, decode seconds
     stat_t = last_chunk = time.time()
     trans_seq = [0]
     who = "them" if tag == "spk" else "you"
+    thr = 0.002 if tag == "spk" else 0.008   # mic has a noise floor
+    hang = 0.0                       # silent seconds still fed —
+                                     # > rule2 so endpoints still fire
+    floor = 0.003                    # mic noise floor (slow-rise)
+    pre, pre_n = deque(), 0          # ~250ms of SKIPPED chunks — fed
+                                     # once on gate-open so onsets
+                                     # aren't clipped
 
     def emit(final):
         """One final, one fate: transcript log (with seg id so the
@@ -1314,6 +1475,37 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
             put_drop(gui_q, ("err",
                              f"speaker capture failed: {chunk[1]}"))
             continue
+        # energy gate: call sides are silent ~half the time — don't
+        # decode pure-zero loopback / idle mic; the idle_gap path
+        # above still force-finalizes a pending partial
+        rms = float(np.sqrt(np.mean(chunk * chunk)))
+        if tag == "mic" and hang <= 0:   # slow-rise floor — drops
+            floor = rms if rms < floor \
+                else floor + (rms - floor) * 0.002   # fast so soft
+        # speech can't pull the threshold up to itself
+        thr_m = max(0.004, 3 * floor) if tag == "mic" else thr
+        if rms > thr_m:
+            if hang <= 0:                # gate just opened — feed
+                for c in pre:            # the ~250ms it missed
+                    try:
+                        f = pipe.feed(c, tag)
+                        if f:
+                            emit(f)
+                    except Exception as e:
+                        rep.set(f"asr-{tag}", "err",
+                                f"decode err: {e}")
+                        break
+            hang = 1.5
+        elif hang > 0:
+            hang -= len(chunk) / SR
+        if hang <= 0 and not pipe.partials.get(tag):
+            pre.append(chunk)            # skipped chunk -> keep for
+            pre_n += len(chunk)          # the next gate-open (~0.25s
+            while pre_n > SR // 4 and len(pre) > 1:   # of pre-roll)
+                pre_n -= len(pre.popleft())
+            continue
+        pre.clear()                      # a fed chunk drops the
+        pre_n = 0                        # pre-roll (fed once)
         try:
             t0 = time.monotonic()
             final = pipe.feed(chunk, tag)
@@ -1331,10 +1523,6 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
                 emit(final)
             elif pipe.partials.get(tag):
                 p = pipe.partials[tag]
-                # raw zipformer partials are ALL-CAPS — sentence-case
-                # them (leave cased models like nemotron alone)
-                if p.isupper():
-                    p = p.capitalize()
                 if p != last_p.get(tag):   # dedupe identical partials
                     last_p[tag] = p
                     put_drop(gui_q, ("partial", tag, p))
@@ -1357,18 +1545,96 @@ else:
 CFG = LOGS / "livecap-window.json"
 
 
+class CaptionView:
+    """Append-only scrollback. Finals are permanent lines; the live
+    partial is one tail region. Words two consecutive partials agree
+    on are 'stable' (bright); the revising tail is dim — a word you
+    already read never changes underneath you."""
+
+    def __init__(self, parent, lines=6, fs=11):
+        t = self.t = tk.Text(
+            parent, bg=BG, fg=TXT, bd=0, highlightthickness=0,
+            wrap="word", height=lines, font=("Segoe UI", fs),
+            padx=12, pady=2, spacing3=3, cursor="arrow",
+            state="disabled")
+        t.tag_configure("stable", foreground=TXT)
+        t.tag_configure("tail", foreground=DIM)
+        t.tag_configure("tr", foreground=ACC,
+                        font=("Segoe UI", fs - 3))
+        t.mark_set("pstart", "end-1c")
+        t.mark_gravity("pstart", "left")
+        self.prev = []
+
+    def _edit(self, fn):
+        # only follow the live edge if already at the bottom —
+        # scrolling up to re-read shouldn't be yanked back down
+        at_bottom = self.t.yview()[1] >= 0.999
+        self.t.configure(state="normal")
+        fn()
+        self.t.configure(state="disabled")
+        if at_bottom:
+            self.t.see("end")
+
+    def partial(self, text):
+        w = text.split()
+        k = 0
+        while (k < min(len(w), len(self.prev))
+               and w[k] == self.prev[k]):
+            k += 1
+        self.prev = w
+
+        def go():
+            self.t.delete("pstart", "end-1c")
+            if k:
+                self.t.insert("end-1c", " ".join(w[:k]) + " ", "stable")
+            if k < len(w):
+                self.t.insert("end-1c", " ".join(w[k:]), "tail")
+        self._edit(go)
+
+    def final(self, text, sid):
+        self.prev = []
+
+        def go():
+            self.t.delete("pstart", "end-1c")
+            self.t.insert("end-1c", text, "stable")
+            self.t.mark_set(f"seg{sid}", "end-1c")
+            self.t.mark_gravity(f"seg{sid}", "left")
+            self.t.insert("end-1c", "\n")
+            self.t.mark_set("pstart", "end-1c")
+            if int(self.t.index("end-1c").split(".")[0]) > 300:
+                self.t.delete("1.0", "100.0")     # bound memory
+                # trimmed seg marks collapse to line 1 but stay
+                # registered — a late translation would land at the
+                # top of the view
+                for m in list(self.t.mark_names()):
+                    if m.startswith("seg") and \
+                            self.t.compare(m, "<=", "1.0"):
+                        self.t.mark_unset(m)
+        self._edit(go)
+
+    def translation(self, sid, text):
+        m = f"seg{sid}"
+        if m in self.t.mark_names():
+            self._edit(lambda: self.t.insert(m, "\n" + text, "tr"))
+
+    def set_font(self, fs):
+        self.t.configure(font=("Segoe UI", fs))
+        self.t.tag_configure("tr", font=("Segoe UI", fs - 3))
+
+
 class Overlay:
     def __init__(self, gui_q, status_items, mute, den_off,
                  mic_active=True):
         self.q = gui_q
         self.mute, self.den_off = mute, den_off
         self.mic_active = mic_active
-        self.them = {"last": "", "now": ""}
         self.me = ""
-        self.tr = ""
         self.seg = 0
         self.finals = deque(maxlen=50)
         self._shown = {}                   # last text pushed per label
+        self._mv_t = 0.0                   # drag/resize throttle
+        self._wpl = 0                      # last applied wraplength
+        self.me_t = 0.0                    # last you: update time
         self.fs, self.alpha = 11, 0.85
         _dpi_aware()
         r = self.root = tk.Tk()
@@ -1380,7 +1646,10 @@ class Overlay:
         r.configure(bg=BG)
         geo = self._load_geo()
         w, h = geo.get("w", int(560 * self.dpi)), \
-            geo.get("h", int(100 * self.dpi))
+            geo.get("h", int(240 * self.dpi))
+        h = max(h, int(200 * self.dpi))  # saved geo may predate the
+                                         # scrollback — never squeeze
+                                         # it to a sliver
         x = geo.get("x", (r.winfo_screenwidth() - w) // 2)
         y = geo.get("y", r.winfo_screenheight() - h - 90)
         # clamp into the virtual screen (all monitors, incl. negative
@@ -1403,6 +1672,9 @@ class Overlay:
 
         top = tk.Frame(r, bg=BG)
         top.pack(fill="x", pady=(0, 2))
+        # drag handle — the Text area itself is for selection, not drag
+        tk.Label(top, bg=BG, fg=MUTE, font=("Segoe UI", 9),
+                 text="≡ ").pack(side="left")
         # buttons pack first so a wide badge row can never clip them
         if self.mic_active:
             self.mute_lbl = self._btn(top, "mic: on", self.tgl_mute)
@@ -1416,34 +1688,41 @@ class Overlay:
         self.dot = tk.Label(self.badges, text="●", fg="#16a34a",
                             bg=BG, font=("Segoe UI", 10))
         self.dot.pack(side="left", padx=(0, 6))
+        self.dot.bind("<Button-1>", self._list_problems)
         self.state_lbls, self.state_lvl, self.state_txt = {}, {}, {}
         self.info_lbl = None
         for comp, lvl, txt in status_items:
             self._set_state(comp, lvl, txt)
 
         self.esc_lbl = mk(fg="#fbbf24", font=("Segoe UI", 9))
-        self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
-        self.trans = mk(fg=ACC, font=("Segoe UI", self.fs - 3))
-        self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
+        self.view = CaptionView(r, lines=6, fs=self.fs)
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
-        self.text_lbls = (self.esc_lbl, self.them_last, self.trans,
-                          self.them_now, self.me_now)
-        for lbl in self.text_lbls:
-            lbl.pack(fill="x", padx=12)
+        self.text_lbls = (self.esc_lbl, self.me_now)
+        self.esc_lbl.pack(fill="x", padx=12)
+        self.view.t.pack(fill="both", expand=True)
+        self.me_now.pack(fill="x", padx=12)
         grip = mk(fg=MUTE, font=("Segoe UI", 8), text="◢",
                   cursor="size_nw_se")
         self._grip = grip
         grip.pack(anchor="se", padx=4)
         grip.bind("<Button-1>", self._rs_down)
+        grip.bind("<B1-Motion>", self._rs_move)
 
         for wdg in (r, top, self.badges, *self.text_lbls):
             wdg.bind("<Button-1>", self._down)
+            wdg.bind("<B1-Motion>", self._move)
         r.bind("<Configure>", self._resized)
         r.bind("<Escape>", self._esc)
         r.bind("m", lambda e: self.tgl_mute())
         r.bind("d", lambda e: self.tgl_den())
-        r.bind("c", lambda e: self.copy_last())
+        # Text's own Ctrl+C must win — 'c' alone still copies the
+        # last caption; extra modifiers skip our handler
+        r.bind("c", lambda e: None if e.state & 0x4 else
+                 self.copy_last())
         r.bind("<MouseWheel>", self._wheel)
+        # wheel over the text scrolls history (plain) or rescales
+        # (ctrl) — must break, or the root handler also fades opacity
+        self.view.t.bind("<MouseWheel>", self._text_wheel)
         signal.signal(signal.SIGINT, self._sigint)
         r.update_idletasks()
         r.report_callback_exception = lambda t, v, tb: diag_exc(
@@ -1506,6 +1785,7 @@ class Overlay:
                 bg=self.LVLCOL["info"], font=("Segoe UI", 8),
                 padx=8, pady=2)
             self.info_lbl.pack(side="left", padx=(0, 4))
+            self.info_lbl.bind("<Button-1>", self._list_problems)
         worst = max(self.state_lvl.values(), key=self._ORDER.get,
                     default="ok")
         self.dot.config(fg=self.DOTCOL.get(worst, "#16a34a"))
@@ -1524,9 +1804,10 @@ class Overlay:
         probs = [f"{c}: {self.state_txt.get(c) or l}"
                  for c, l in self.state_lvl.items()
                  if l in ("warn", "err")]
-        if probs:
-            self.esc_lbl.config(text=" · ".join(probs))
-            self.root.after(3500, self._esc_clear)
+        self.esc_lbl.config(
+            text=" · ".join(probs)
+            or "ctrl+alt+m mute · ctrl+alt+d denoise")
+        self.root.after(3500, self._esc_clear)
 
     def _sigint(self, *_):
         # Tcl's event wait swallows Ctrl+C; after() wakes the loop
@@ -1535,29 +1816,43 @@ class Overlay:
         except Exception:
             pass
 
-    def _native_nc(self, hit):
-        """Hand a drag to Windows' own modal loop — WM_NCLBUTTONDOWN
-        on a caption/grip area. The OS moves/resizes the window with
-        ZERO Python work per mouse event, so ASR/decode GIL pressure
-        can't freeze a drag the way B1-Motion -> geometry() did."""
-        import ctypes
-        u = ctypes.windll.user32
-        u.ReleaseCapture()
-        u.SendMessageW(int(self.root.wm_frame(), 16), 0x00A1, hit, 0)
-
     def _down(self, e):
-        if isinstance(e.widget, tk.Button) or e.widget is self._grip:
-            return                       # buttons/grip keep their own
-        try:                             # behavior; anything else is
-            self._native_nc(0x2)         # a caption area -> HTCAPTION
-        except Exception:
-            pass
+        """Manual drag — throttled to ~30Hz. The native HTCAPTION
+        modal loop nested a Windows pump inside SendMessage, which
+        re-entered Tcl and killed the process silently (console off)."""
+        # toplevel bindtags deliver child-widget presses here too —
+        # arming a drag on a Text/Button press would also select the
+        # text AND move the window
+        if isinstance(e.widget, tk.Button) or e.widget in (
+                self._grip, self.view.t):
+            self._dx = None              # this press must not drag
+            return
+        self._dx, self._dy = e.x_root - self.root.winfo_x(), \
+            e.y_root - self.root.winfo_y()
+
+    def _move(self, e):
+        if getattr(self, "_dx", None) is None:
+            return
+        now = time.monotonic()
+        if now - self._mv_t < 0.033:     # coalesce motion floods —
+            return                       # geometry() is the GIL-cost
+        self._mv_t = now
+        self.root.geometry(
+            f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
     def _rs_down(self, e):
-        try:
-            self._native_nc(0x11)        # HTBOTTOMRIGHT
-        except Exception:
-            pass
+        self._rx, self._ry = e.x_root, e.y_root
+        self._rw, self._rh = (self.root.winfo_width(),
+                              self.root.winfo_height())
+
+    def _rs_move(self, e):
+        now = time.monotonic()
+        if now - self._mv_t < 0.033:
+            return
+        self._mv_t = now
+        w = max(int(360 * self.dpi), self._rw + e.x_root - self._rx)
+        h = max(int(140 * self.dpi), self._rh + e.y_root - self._ry)
+        self.root.geometry(f"{w}x{h}")
 
     def _resized(self, e):
         """Wrap labels to the new width and clamp a minimum size —
@@ -1565,19 +1860,27 @@ class Overlay:
         if e.widget is not self.root:
             return
         wpl = e.width - int(24 * self.dpi)
-        for lbl in self.text_lbls:
-            lbl.config(wraplength=wpl)
+        if wpl != self._wpl:               # skip a same-width reflow
+            self._wpl = wpl
+            for lbl in self.text_lbls:
+                lbl.config(wraplength=wpl)
         w = max(int(360 * self.dpi), e.width)
-        h = max(int(60 * self.dpi), e.height)
+        h = max(int(140 * self.dpi), e.height)
         if (w, h) != (e.width, e.height):
             self.root.geometry(f"{w}x{h}")
+
+    def _text_wheel(self, e):
+        if e.state & 0x4:                    # ctrl: font size
+            self._wheel(e)
+        else:                                # plain: scroll history
+            self.view.t.yview_scroll(
+                -3 if e.delta > 0 else 3, "units")
+        return "break"                       # skip root's opacity
 
     def _wheel(self, e):
         if e.state & 0x4:                        # ctrl+wheel: font size
             self.fs = max(8, min(20, self.fs + (1 if e.delta > 0 else -1)))
-            self.them_last.config(font=("Segoe UI", self.fs - 1))
-            self.them_now.config(font=("Segoe UI", self.fs))
-            self.trans.config(font=("Segoe UI", self.fs - 3))
+            self.view.set_font(self.fs)
             self.me_now.config(font=("Segoe UI", self.fs - 1))
         else:                                    # wheel: opacity
             self.alpha = max(0.35, min(1.0,
@@ -1623,7 +1926,8 @@ class Overlay:
 
     def copy_last(self):
         self.root.clipboard_clear()
-        self.root.clipboard_append(self.them["now"] or self.them["last"])
+        self.root.clipboard_append(self.finals[-1]
+                                   if self.finals else "")
 
     def copy_all(self):
         self.root.clipboard_clear()
@@ -1644,68 +1948,76 @@ class Overlay:
         if stop.is_set():
             return
         dirty = False
-        try:
-            while True:
+        pend = None                        # newest queued spk partial
+        try:                               # — renders once after the
+            while True:                    # drain, not per event
                 ev = self.q.get_nowait()
                 dirty = True
                 if ev[0] == "partial":
                     _, tag, text = ev
                     if tag == "spk":
-                        self.them["now"] = text
-                    else:
+                        pend = text      # coalesced — only the
+                    else:                # newest partial renders
                         self.me = "you: " + text
+                        self.me_t = time.time()
                 elif ev[0] == "final":
                     _, tag, text, *rest = ev
                     self.finals.append(
                         ("them" if tag == "spk" else "you") + ": " + text)
                     if tag == "spk":
-                        self.them["last"], self.them["now"] = text, ""
+                        pend = None          # final supersedes
                         self.seg = rest[0] if rest else 0
-                        self.tr = ""         # the old seg's
-                                             # translation is stale
-                    else:
+                        self.view.final(text, self.seg)
+                        if time.time() - self.me_t > 3:
+                            self.me = ""     # stale you: clears only
+                                             # if you're not mid-line
+                    else:                    # when their turn ends
                         self.me = "you: " + text
+                        self.me_t = time.time()
                 elif ev[0] == "trans":
-                    if len(ev) < 3 or ev[2] == self.seg:
-                        self.tr = ev[1]      # stale segments dropped
-                elif ev[0] == "hotkey":
+                    if len(ev) >= 3:
+                        # attaches to its own segment line — a stale
+                        # seg finds no mark and is dropped
+                        self.view.translation(ev[2], ev[1])
+                elif ev[0] == "sync":
+                    # the hotkey worker already flipped the flag —
+                    # just reflect it in labels/badges
                     if ev[1] == "mute":
-                        self.tgl_mute()
-                    elif ev[1] == "den":
-                        self.tgl_den()
+                        muted = self.mute.is_set()
+                        if self.mic_active:
+                            self.mute_lbl.config(
+                                text="mic: muted" if muted
+                                else "mic: on")
+                        if muted:
+                            self._set_state("mute", "err", "MIC MUTED")
+                        else:
+                            self._set_state("mute", "ok")
+                    elif ev[1] == "den" and self.mic_active:
+                        self.den_lbl.config(
+                            text="denoise: off"
+                            if self.den_off.is_set()
+                            else "denoise: on")
                 elif ev[0] == "state":
                     # badge/dot only — never overwrite the caption
                     self._set_state(ev[1], ev[2],
                                     ev[3] if len(ev) > 3 else "")
                 elif ev[0] == "err":
-                    self.them["now"] = str(ev[1])
+                    self.view.partial(str(ev[1]))
                     self._set_state("worker", "err", str(ev[1])[:40])
         except queue.Empty:
             pass
         except Exception:                    # one bad event must not
             pass                             # kill the drain loop
+        if pend is not None:
+            self.view.partial(pend)
         if dirty:
             zwsp = "\u200b"
-            for lbl, txt in ((self.them_last, self.them["last"]),
-                             (self.them_now, self.them["now"]),
-                             (self.trans, self.tr),
-                             (self.me_now, self.me)):
-                txt = txt or zwsp
-                # config() re-lays out even for identical text —
-                # skip it when nothing changed (e.g. a badge event)
-                if self._shown.get(lbl) != txt:
-                    self._shown[lbl] = txt
-                    lbl.config(text=txt)
-            # grow to fit wrapped text (never auto-shrinks) — anchored
-            # at the bottom edge so growth can't leave the screen
-            self.root.update_idletasks()
-            rh = self.root.winfo_reqheight()
-            h0 = self.root.winfo_height()
-            if rh > h0 + 2:
-                new_y = max(self._vtop,
-                            self.root.winfo_y() + h0 - rh)
-                self.root.geometry(f"{self.root.winfo_width()}x{rh}"
-                                   f"+{self.root.winfo_x()}+{new_y}")
+            # me_now is a label; config() re-lays out even for
+            # identical text — skip it when nothing changed
+            txt = self.me or zwsp
+            if self._shown.get(self.me_now) != txt:
+                self._shown[self.me_now] = txt
+                self.me_now.config(text=txt)
 
     def close(self):
         if getattr(self, "_closed", False):   # Esc x2 + Ctrl+C can
@@ -1742,6 +2054,13 @@ def main():
 
     if not acquire_single_instance():
         raise SystemExit("livecap is already running")
+    try:
+        import ctypes
+        # 15.6ms default timer granularity ~= a whole audio frame —
+        # tighten it for the queue timeouts and waits everywhere
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
 
     _dpi_aware()                       # before ANY window exists
     splash = loading_splash()        # models take seconds to load —
@@ -1759,35 +2078,44 @@ def main():
     _diag_log[0] = open(dp, "a", encoding="utf-8", buffering=1)
     sys.excepthook = lambda t, v, tb: diag_exc("fatal", t, v, tb)
 
-    # preflight BEFORE any sherpa call — a missing file exits the
-    # process silently from native code when the console is hidden
-    model_dir = find_asr_dir()
-    missing = preflight(ROOT, model_dir)
-    if missing:
-        raise SystemExit("missing model files:\n  "
-                         + "\n  ".join(str(m) for m in missing))
-
     def _load_models():
+        ensure_asr_model()               # downloads if missing —
+        model_dir = find_asr_dir()       # splash stays up via pump
+        # preflight before any sherpa call — a missing file exits
+        # silently from native code when the console is hidden
+        missing = preflight(ROOT, model_dir)
+        if missing:
+            raise SystemExit("missing model files:\n  "
+                             + "\n  ".join(str(m) for m in missing))
         den = make_denoiser()
         diag(f"ASR model: {model_dir.name}")
-        rec, asr_provider = make_recognizer(model_dir)
+        nth = asr_threads(os.cpu_count() or 4, 2)
+        rec, asr_provider = make_recognizer(model_dir, nth)
         diag(f"ASR provider: {asr_provider}")
-        punct = (None if "nemotron" in model_dir.name.lower()
-                 else make_punctuator())
-        return den, rec, punct
-    try:
-        pump = (lambda: splash.update()) if splash else             (lambda: time.sleep(0.05))
-        den, rec, punct = run_with_pump(_load_models, pump)
+        rec2, _ = make_recognizer(model_dir, nth)   # 2nd instance — memory
+        return den, rec, rec2                  # is cheap, CPU isn't:
+    try:                                     # decode can't serialize
+        def pump():
+            if splash:
+                splash._lbl.config(text=(
+                    "livecap — loading models…"
+                    if _dl.get("done") or not _dl["mb"]
+                    else f"downloading model — {_dl['mb']} MB"))
+                splash.update()
+            else:
+                time.sleep(0.05)
+        den, rec, rec2 = run_with_pump(_load_models, pump)
     except BaseException:
         drop_splash()                    # splash must not outlive us
         raise
-    pipe = Pipeline(rec, punct)
+    pipe = Pipeline(rec)                 # spk stream
+    pipe_mic = Pipeline(rec2)            # mic stream — own lock pool
 
     status = []
     # queues first — the cable's finished_callback reports to gui_q
     mic_q = queue.Queue(maxsize=10)      # voice path: <160ms, drop not delay
     micasr_q = queue.Queue(maxsize=64)   # ~1s of 16ms chunks
-    qs = queue.Queue(maxsize=64)         # ~2s of 32ms chunks
+    qs = queue.Queue(maxsize=20)         # ~2s of 100ms chunks
     gui_q = queue.Queue(maxsize=1024)     # bounded — a stalled overlay
                                           # can't eat RAM
     rep = Reporter(gui_q)                  # ONE dedupe memory shared
@@ -1801,6 +2129,8 @@ def main():
              "ev": threading.Event(), "cands": []}
     cands = cable_candidates()
     state["cands"] = cands
+    state["sig"] = dev_sig()           # reinit only fires when the
+                                       # device set actually changes
     if not cands:
         state["cable_absent"] = True
         status.append(("cable","warn","no VB-CABLE"))
@@ -1849,32 +2179,37 @@ def main():
         diag_exc(f"thread {a.thread.name} died",
                  a.exc_type, a.exc_value, a.exc_traceback),
         put_drop(gui_q, ("state", "worker", "err", f"{a.thread.name} died")))
-    trans_q = queue.Queue(maxsize=4) if args.lang else None
+    trans_q = queue.Queue(maxsize=16) if args.lang else None
 
     in_stream, mic_sr = None, SR
-    if out_stream is None:
-        status.append(("mic","warn","mic off"))
+    # you: captions need only the mic — passthrough needs the cable
+    mic_idx = pick_mic()
+    if mic_idx is None:
+        status.append(("mic","warn","no mic"))
+        mark_dead(state, "mic", rep, "no mic")
     else:
-        mic_idx = pick_mic()
-        if mic_idx is None:
-            status.append(("mic","warn","no mic"))
-            mark_dead(state, "mic", rep, "no mic")
-        else:
-         try:
-            st, mic_sr = open_mic(
-                mic_idx, den, mic_q, gui_q,
-                dead=dead_cb(state, "mic", rep,
-                             "mic stream stopped"))
+     try:
+        st, mic_sr = open_mic(
+            mic_idx, den, mic_q, gui_q,
+            dead=dead_cb(state, "mic", rep,
+                         "mic stream stopped"))
+        try:
             st.start()
-            in_stream = st                 # assign only after start()
-            state["in"], state["mic_sr"] = st, mic_sr
-            status.append(("mic","ok","mic ✓"))
-            diag(f"mic open: dev{mic_idx} {mic_sr}Hz "
-                 f"latency={st.latency}")
-         except Exception as e:
-            status.append(("mic","warn","no mic"))
-            diag(f"no mic input ({e})")
-            mark_dead(state, "mic", rep, "mic open failed")
+        except Exception:
+            try:                     # a failed start leaks the
+                st.close()           # stream handle — close it
+            except Exception:
+                pass
+            raise
+        in_stream = st                 # assign only after start()
+        state["in"], state["mic_sr"] = st, mic_sr
+        status.append(("mic","ok","mic ✓"))
+        diag(f"mic open: dev{mic_idx} {mic_sr}Hz "
+             f"latency={st.latency}")
+     except Exception as e:
+        status.append(("mic","warn","no mic"))
+        diag(f"no mic input ({e})")
+        mark_dead(state, "mic", rep, "mic open failed")
     if out_stream is not None:
         try:
             out_stream.start()
@@ -1911,15 +2246,21 @@ def main():
              dict(args=(pipe, qs, gui_q, log, log_lock,
                         "spk", trans_q))),
             (asr_consumer, "asr-mic",
-             dict(args=(pipe, micasr_q, gui_q, log,
+             dict(args=(pipe_mic, micasr_q, gui_q, log,
                         log_lock, "mic"))),
             (hotkey_worker, "hotkey",
-             dict(args=(gui_q,), kwargs=dict(tid_out=hk_tid))),
+             dict(args=(gui_q,), kwargs=dict(
+                 mute=mute, den_off=den_off, tid_out=hk_tid))),
     ]
     for tgt, name, kw in worker_defs:
         t = threading.Thread(target=tgt, daemon=True, name=name, **kw)
         t.start()
         workers.append(t)
+    try:                                 # startup allocations done —
+        import gc                        # a gen-2 sweep mid-call is a
+        gc.freeze()                      # hiccup on the audio path
+    except Exception:
+        pass
     if trans_q is not None:
         # honest disclosure: captions leave the box for translation
         status.append(("trans","info",f"{args.lang}·online"))
@@ -1930,6 +2271,7 @@ def main():
                                    args.trans_email))
         t.start()
         workers.append(t)
+    status.append(("log","info","log"))      # disclosure chip
 
     diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
@@ -1946,8 +2288,11 @@ def main():
                     hk_tid[0], 0x0012, 0, 0)   # WM_QUIT — it unregisters
         except Exception:                # + joins; daemon dies anyway
             pass
-        for w in workers:                # let workers flush + emit
-            w.join(timeout=3)
+        end = time.time() + 4            # shared deadline — worst
+        for w in workers:                # case is one hung worker,
+            w.join(timeout=max(0.05, end - time.time()))  # not N*3s
+            if w.is_alive():
+                diag(f"shutdown: {w.name} still blocked")
             if w.is_alive():
                 diag(f"shutdown: {w.name} still blocked after 3s")
         try:

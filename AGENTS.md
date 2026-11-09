@@ -20,7 +20,7 @@ Zero-arg Krisp-style app. Run: `.venv\Scripts\python.exe livecap.py`
 | Leg | Path |
 |---|---|
 | outbound | mic -> GTCRN denoise -> VB-CABLE virtual mic -> `you:` caption |
-| inbound | WASAPI speaker loopback -> zipformer ASR -> `[them]` caption |
+| inbound | WASAPI speaker loopback -> kroko ASR -> `[them]` caption |
 
 ## Threading model
 
@@ -57,12 +57,30 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   CPU-only and silently falls back for other provider strings, so
   `make_recognizer` reports what the build actually has
   (`ASR provider: cpu`)
-- ASR = streaming zipformer int8 — `asr_dir()` prefers dirs with BOTH
-  "zipformer" and "stream" in the name (avoids offline variants);
-  punct skipped for nemotron-family dirs
-- endpoint rules 2.4/1.2s trailing silence, 20s utterance cap;
-  `Pipeline.flush()` pads 0.75s silence before `input_finished()` —
-  streaming transducers drop final tokens without it
+- ASR = sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06 (80 mel
+  bins, native case+punct — no punct model or casing path);
+  `asr_dir()` hard-requires a "kroko" dir under `model_dirs()`
+  (ROOT/models then %LOCALAPPDATA%\livecap\models);
+  `ensure_asr_model()` downloads it on first run — pinned SHA-256,
+  30s socket timeout, .dl/ temp + member guard + rename;
+  build.ps1 fetches it too
+- TWO recognizer instances (spk + mic) decode in PARALLEL — memory
+  is cheap, CPU isn't; intra-op threads split via
+  `asr_threads()` = cpu//2 each
+- partials arrive in model-size chunks; endpoint rules 2.4/1.2s
+  trailing silence, 20s utterance cap; `Pipeline.flush()` pads 1.0s
+  silence before `input_finished()`
+- energy gate skips decode during silence (hang 1.5s > rule2); a
+  ~250ms pre-roll deque of SKIPPED chunks feeds the onset once on
+  gate-open; mic floor is slow-rise (drops fast to rms, rises at
+  0.2%) so soft speech can't lift its own threshold
+- the mic opens INDEPENDENT of the cable — you: captions need only
+  the mic, passthrough needs the cable; `_sd_reinit` fires only when
+  `dev_sig()` (COM-safe mic+speaker id set) actually changed, and
+  closes ALL streams (~1s gap)
+- hotkeys Ctrl+Alt+M / Ctrl+Alt+D — the worker flips mute/den_off
+  itself and pushes ("sync", ...) so a dead Tk can't desync state
+- [you] captions tap the RAW mic chunk — denoise eats consonants
 - queue `get(timeout=0.02)` (20ms); sizes tuned to real latency:
   mic_q=10 (~0.16s — voice path drops, never delays), qs/micasr_q=64
   (~2s/~1s), trans_q=4, gui_q=1024; all puts via `put_drop`
@@ -75,7 +93,9 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - `stream_supervisor` reopens dead mic/cable streams (finished_callback
   or stall -> `mark_dead` -> backoff 1/2/5s, retry logging throttled
   via `_should_log_fail`) — engine picks up new ring/rates from the
-  shared `state` dict each chunk; `rs` rebuilds on rate change AND
+  shared `state` dict each chunk; `_sd_reinit` closes ALL streams
+  before `_terminate` (Pa_Terminate would kill them anyway ->
+  dangling close()) — ~1s passthrough gap; `rs` rebuilds on rate change AND
   on ring OBJECT swap at the same rate (a reopened cable's skew
   differs from what `rs.trim` learned; ring->None drops rs so the
   stat path never fills a missing ring). `mic_rs`/`pend` reset ONLY
@@ -158,7 +178,11 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 - **Esc requires double-press within 2.5s** (single Esc mid-call was
   a real hazard — intentional, don't "fix" it); Ctrl+C quits
 - Partials deduped via `last_p` (push only on text change; entry
-  dropped on final); raw zipformer ALL-CAPS sentence-cased
+  dropped on final); kroko partials are natively cased
+- captions render in a tk.Text scrollback (`CaptionView`) — finals
+  are permanent lines, partial tail splits stable/dim by
+  2-partial agreement, translations attach via seg marks;
+  wheel=scroll, ctrl+wheel=font, drag via ≡ handle / labels
 - Geometry persisted to `livecap-window.json`; restored position
   clamped into the virtual screen via `GetSystemMetrics` (all
   monitors incl. negative coords)
@@ -202,14 +226,17 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
 `--standalone` + `--enable-plugin=tk-inter` + include-package for
 sherpa_onnx/soundcard/sounddevice/deep_translator, console forced on
 (verify before `--windows-console-mode=disable`), then
-`robocopy models /E /XF NUL CON PRN AUX` — the nemotron tarball
-contains a NUL device-name artifact that kills Copy-Item.
+`robocopy models /E /XF NUL CON PRN AUX /XD <other models>` — model
+tarballs can contain NUL device-name artifacts that kill Copy-Item;
+/XD keeps benchmark/alternate model dirs out of the dist.
 Result: `build\livecap.dist\livecap.exe`, models beside it.
 
 ## Verified facts (6 vCPU Hyper-V, no dedicated GPU)
 
-- zipformer int8 RTF ~0.5 — only model sustaining real-time;
-  nemotron-0.6b RTF ~2.5 (offline use only). GTCRN RTF ~0.45
+- kroko zipformer int8 RTF ~0.04 (measured, greedy, 3 threads) —
+  bench_asr.py; nemotron-560ms was ~0.36, 160ms ~1.03 (removed);
+  parakeet-unified buffered ~3.6 (removed).
+  GTCRN RTF ~0.45 (1 thread — intra-op threads just spin)
 - GTCRN: 16ms frame shift + 16ms steady-state buffer + ~2ms
   compute/frame; mic->cable total = ~40ms ring target + 16ms frame +
   both stream latencies (see `latency=` diag lines); NOIZEUS 5dB: -9

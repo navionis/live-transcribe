@@ -225,14 +225,106 @@ class ReporterTest(unittest.TestCase):
             ("state", "mic", "ok", "")])
 
 
-class BadgeTest(unittest.TestCase):
-    """H2 — warn/err get badges; ok/info fold into dot + chip."""
+class AsrThreadsTest(unittest.TestCase):
+    """Split-core helper — never oversubscribes, never returns 0."""
 
-    def test_visibility_rule(self):
-        self.assertTrue(livecap.badge_shown("warn"))
-        self.assertTrue(livecap.badge_shown("err"))
-        self.assertFalse(livecap.badge_shown("ok"))
-        self.assertFalse(livecap.badge_shown("info"))
+    def test_bounds(self):
+        self.assertEqual(livecap.asr_threads(6, 2), 3)
+        self.assertEqual(livecap.asr_threads(6, 3), 2)
+        self.assertEqual(livecap.asr_threads(6, 8), 1)   # never 0
+        self.assertLessEqual(livecap.asr_threads(6, 2) * 2, 6)
+
+
+class AsrMissingTest(unittest.TestCase):
+    """asr_missing checks ONLY the ASR model — a missing gtcrn must
+    not trigger a 250MB re-download."""
+
+    def test_complete_asr_dir_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "kroko-x"
+            d.mkdir()
+            (d / "tokens.txt").write_text("x")
+            for p in ("encoder", "decoder", "joiner"):
+                (d / f"{p}-a.onnx").write_bytes(b"x")
+            self.assertEqual(livecap.asr_missing(d), [])
+
+    def test_none_and_missing(self):
+        self.assertEqual(livecap.asr_missing(None), ["asr"])
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td) / "x"
+            d.mkdir()
+            self.assertTrue(livecap.asr_missing(d))
+
+
+class ReinitClosesAllTest(unittest.TestCase):
+    """Pa_Terminate kills open streams — close + mark dead first."""
+
+    def test_live_streams_closed_and_marked_dead(self):
+        calls = []
+
+        class St:
+            def stop(self):
+                calls.append("stop")
+            def close(self):
+                calls.append("close")
+
+        state = {"in": St(), "out": St(), "ring": object(),
+                 "mic_dead": False, "cable_dead": False,
+                 "reinit_t": -999.0, "ev": threading.Event(),
+                 "cands": []}
+        rep = livecap.Reporter(queue.Queue())
+        with mock.patch.object(livecap.sd, "_terminate"), \
+                mock.patch.object(livecap.sd, "_initialize"), \
+                mock.patch.object(livecap, "cable_candidates",
+                                  return_value=[0]):
+            self.assertTrue(livecap._sd_reinit(state, rep))
+        self.assertEqual(calls, ["stop", "close", "stop", "close"])
+        self.assertIsNone(state["in"])
+        self.assertIsNone(state["out"])
+        self.assertIsNone(state["ring"])
+        self.assertTrue(state["mic_dead"])
+        self.assertTrue(state["cable_dead"])
+        self.assertEqual(state["cands"], [0])
+
+    def test_unchanged_sig_skips_reinit(self):
+        state = {"in": None, "out": None, "ring": None,
+                 "reinit_t": -999.0, "ev": threading.Event(),
+                 "sig": frozenset({"a", "b"})}
+        rep = livecap.Reporter(queue.Queue())
+        with mock.patch.object(livecap, "dev_sig",
+                               return_value=frozenset({"a", "b"})):
+            self.assertFalse(livecap._sd_reinit(state, rep))
+
+    def test_changed_sig_reinits(self):
+        class St:
+            def stop(self):
+                pass
+            def close(self):
+                pass
+        state = {"in": St(), "out": None, "ring": object(),
+                 "mic_dead": False, "cable_dead": True,
+                 "reinit_t": -999.0, "ev": threading.Event(),
+                 "sig": frozenset({"a"})}
+        rep = livecap.Reporter(queue.Queue())
+        with mock.patch.object(livecap, "dev_sig",
+                               return_value=frozenset({"a", "b"})), \
+                mock.patch.object(livecap.sd, "_terminate"), \
+                mock.patch.object(livecap.sd, "_initialize"), \
+                mock.patch.object(livecap, "cable_candidates",
+                                  return_value=[]):
+            self.assertTrue(livecap._sd_reinit(state, rep))
+        self.assertEqual(state["sig"], frozenset({"a", "b"}))
+
+
+class Sha256FileTest(unittest.TestCase):
+
+    def test_known_bytes(self):
+        import hashlib, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "f.bin"
+            p.write_bytes(b"livecap")
+            self.assertEqual(livecap.sha256_file(p),
+                             hashlib.sha256(b"livecap").hexdigest())
 
 
 class RingResetTest(unittest.TestCase):
@@ -272,10 +364,6 @@ class PreflightTest(unittest.TestCase):
         for p in ("encoder", "decoder", "joiner"):
             (mdir / f"{p}-a.onnx").write_bytes(b"x")
         (models / "gtcrn_simple.onnx").write_bytes(b"x")
-        punct = models / livecap.PUNCT_DIR.name
-        punct.mkdir()
-        (punct / "model.int8.onnx").write_bytes(b"x")
-        (punct / "bpe.vocab").write_text("x")
         return mdir
 
     def test_no_models_dir(self):
@@ -293,8 +381,7 @@ class PreflightTest(unittest.TestCase):
             (mdir / "tokens.txt").write_text("x")
             (mdir / "encoder-a.onnx").write_bytes(b"x")
             names = [str(m) for m in livecap.preflight(root, mdir)]
-            for want in ("gtcrn_simple.onnx", "decoder", "joiner",
-                         "model.int8.onnx", "bpe.vocab"):
+            for want in ("gtcrn_simple.onnx", "decoder", "joiner"):
                 self.assertTrue(any(want in n for n in names), want)
             self.assertFalse(any("encoder" in n for n in names))
 
@@ -305,18 +392,6 @@ class PreflightTest(unittest.TestCase):
             (root / "models" / "gtcrn_simple.onnx").write_bytes(b"x")
             names = [str(m) for m in livecap.preflight(root, None)]
             self.assertTrue(any("ASR model dir" in n for n in names))
-
-    def test_nemotron_skips_punct(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            models = root / "models"
-            mdir = models / "nemotron-x"
-            mdir.mkdir(parents=True)
-            (mdir / "tokens.txt").write_text("x")
-            for p in ("encoder", "decoder", "joiner"):
-                (mdir / f"{p}-a.onnx").write_bytes(b"x")
-            (models / "gtcrn_simple.onnx").write_bytes(b"x")
-            self.assertEqual(livecap.preflight(root, mdir), [])
 
     def test_complete_tree(self):
         with tempfile.TemporaryDirectory() as td:
@@ -976,45 +1051,6 @@ class RingArmedTest(unittest.TestCase):
         self.assertEqual(r.underruns, 1)
 
 
-class PunctOutsideLockTest(unittest.TestCase):
-    """P8 — the shared punctuator must not run under the decode
-    lock, or one stream's punctuation stalls the other's decode."""
-
-    def test_punct_runs_unlocked(self):
-        seen = {}
-
-        class FakeStream:
-            def accept_waveform(self, sr, s):
-                pass
-            def input_finished(self):
-                pass
-
-        class FakeRec:
-            pipe = None
-            def create_stream(self):
-                return FakeStream()
-            def is_ready(self, s):
-                return False
-            def is_endpoint(self, s):
-                return True
-            def get_result(self, s):
-                return "WORDS HERE"
-            def reset(self, s):
-                pass
-
-        class FakePunct:
-            def add_punctuation_with_case(self, text):
-                seen["locked"] = rec.pipe.lock.locked()
-                return "Words here."
-
-        rec = FakeRec()
-        pipe = livecap.Pipeline(rec, FakePunct())
-        rec.pipe = pipe
-        self.assertEqual(pipe.feed(np.ones(64, np.float32), "spk"),
-                         "Words here.")
-        self.assertFalse(seen["locked"])
-
-
 class FindAsrDirTest(unittest.TestCase):
     """N6 — asr_dir's SystemExit is BaseException: must still yield
     the full preflight list, not crash before it."""
@@ -1069,7 +1105,7 @@ class PipelineLockTest(unittest.TestCase):
                 self._m("reset")
 
         rec = FakeRec()
-        pipe = livecap.Pipeline(rec, None)
+        pipe = livecap.Pipeline(rec)
         rec.pipe = pipe
         pipe.feed(np.ones(64, np.float32), "spk")
         pipe.flush("spk")
