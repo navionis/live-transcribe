@@ -241,7 +241,7 @@ class AsrMissingTest(unittest.TestCase):
 
     def test_complete_asr_dir_passes(self):
         with tempfile.TemporaryDirectory() as td:
-            d = Path(td) / "nemotron-560ms-x"
+            d = Path(td) / "kroko-x"
             d.mkdir()
             (d / "tokens.txt").write_text("x")
             for p in ("encoder", "decoder", "joiner"):

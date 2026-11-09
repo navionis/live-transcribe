@@ -178,24 +178,24 @@ class Resampler:
 
 
 def asr_dir() -> Path:
-    # nemotron-560ms ONLY — feature_dim=128 is baked in, so falling
+    # kroko zipformer ONLY — feature_dim=80 is baked in, so falling
     # back to another model would decode garbage
     for mroot in model_dirs():
         if not mroot.is_dir():
             continue
         models = [d for d in mroot.iterdir()
                   if (d / "tokens.txt").is_file()
-                  and "nemotron" in d.name and "560ms" in d.name]
+                  and "kroko" in d.name]
         if models:
             return sorted(models)[0]
-    raise SystemExit("no nemotron-560ms model dir under models/")
+    raise SystemExit("no kroko model dir under models/")
 
 
 ASR_TAR_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/"
-               "download/asr-models/sherpa-onnx-nemotron-speech-"
-               "streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2")
-ASR_TAR_SHA256 = ("78e2b79fcf7271553a74402a76b771b09ea40"
-                  "117a39566a79f52235b23db6358")
+               "download/asr-models/sherpa-onnx-streaming-"
+               "zipformer-en-kroko-2025-08-06.tar.bz2")
+ASR_TAR_SHA256 = ("c8676e5ff9ac2a85296e53ee0fd4d5fb1db6770e7a76471"
+                  "66eeafe349ade6834")
 
 
 def model_dirs() -> list:
@@ -279,7 +279,7 @@ def ensure_asr_model():
             shutil.rmtree(mroot / p.name, ignore_errors=True)
             p.replace(mroot / p.name)
         _dl["done"] = True
-        diag("nemotron model unpacked")
+        diag("kroko model unpacked")
     except SystemExit:
         raise
     except Exception as e:
@@ -318,7 +318,7 @@ def make_recognizer(model_dir: Path, threads: int = 0):
               encoder=pick("encoder"), decoder=pick("decoder"),
               joiner=pick("joiner"),
               num_threads=threads or os.cpu_count() or 4,
-              sample_rate=SR, feature_dim=128,   # nemotron 128 mel bins
+              sample_rate=SR, feature_dim=80,    # zipformer 80 mel bins
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
               rule2_min_trailing_silence=1.2,
@@ -1335,7 +1335,7 @@ def loopback_pump(qs, gui_q):
                     rep.set("speaker", "ok")
                     diag("speaker capture ok")
                 put_drop(qs, rec.record(1600)[:, 0])   # 100ms chunks —
-                # the model decodes in 560ms blocks anyway; 6x fewer
+                # the model decodes in blocks anyway; 6x fewer
                 # Python round-trips through the pump
             except Exception as e:
                 close_rec()

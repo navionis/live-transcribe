@@ -19,11 +19,11 @@ $PY = ".\.venv\Scripts\python.exe"
     --output-dir=build livecap.py
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# ASR model: nemotron-560ms is required at runtime - fetch if absent
+# ASR model: kroko zipformer is required at runtime - fetch if absent
 $mdir = Get-ChildItem models -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match 'nemotron' -and $_.Name -match '560ms' }
+    Where-Object { $_.Name -match 'kroko' }
 if (-not $mdir) {
-    $name = 'sherpa-onnx-nemotron-speech-streaming-en-0.6b-560ms-int8-2026-04-25'
+    $name = 'sherpa-onnx-streaming-zipformer-en-kroko-2025-08-06'
     $tar = Join-Path $env:TEMP ($name + '.tar.bz2')
     Write-Host "downloading $name ..."
     Invoke-WebRequest -UseBasicParsing `
@@ -36,7 +36,7 @@ if (-not $mdir) {
 
 # models ship next to the exe (not embedded - large, swappable).
 # robocopy: excludes device-name artifacts (NUL etc.) extracted by tar
-robocopy models build\livecap.dist\models /E /XF NUL CON PRN AUX /XD "*160ms*" /NFL /NDL /NJH /NJS | Out-Null
+robocopy models build\livecap.dist\models /E /XF NUL CON PRN AUX /XD "*160ms*" "*nemotron*" "*fast-conformer*" "*parakeet*" "*zipformer-en-202*" /NFL /NDL /NJH /NJS | Out-Null
 if ($LASTEXITCODE -gt 7) { exit $LASTEXITCODE }   # robocopy: 0-7 = ok
 
 Write-Host ""
