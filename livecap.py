@@ -1390,6 +1390,7 @@ class Overlay:
         self.seg = 0
         self.finals = deque(maxlen=50)
         self._shown = {}                   # last text pushed per label
+        self._mv_t = 0.0                   # drag/resize throttle
         self.fs, self.alpha = 11, 0.85
         _dpi_aware()
         r = self.root = tk.Tk()
@@ -1456,9 +1457,11 @@ class Overlay:
         self._grip = grip
         grip.pack(anchor="se", padx=4)
         grip.bind("<Button-1>", self._rs_down)
+        grip.bind("<B1-Motion>", self._rs_move)
 
         for wdg in (r, top, self.badges, *self.text_lbls):
             wdg.bind("<Button-1>", self._down)
+            wdg.bind("<B1-Motion>", self._move)
         r.bind("<Configure>", self._resized)
         r.bind("<Escape>", self._esc)
         r.bind("m", lambda e: self.tgl_mute())
@@ -1556,29 +1559,36 @@ class Overlay:
         except Exception:
             pass
 
-    def _native_nc(self, hit):
-        """Hand a drag to Windows' own modal loop — WM_NCLBUTTONDOWN
-        on a caption/grip area. The OS moves/resizes the window with
-        ZERO Python work per mouse event, so ASR/decode GIL pressure
-        can't freeze a drag the way B1-Motion -> geometry() did."""
-        import ctypes
-        u = ctypes.windll.user32
-        u.ReleaseCapture()
-        u.SendMessageW(int(self.root.wm_frame(), 16), 0x00A1, hit, 0)
-
     def _down(self, e):
+        """Manual drag — throttled to ~30Hz. The native HTCAPTION
+        modal loop nested a Windows pump inside SendMessage, which
+        re-entered Tcl and killed the process silently (console off)."""
         if isinstance(e.widget, tk.Button) or e.widget is self._grip:
-            return                       # buttons/grip keep their own
-        try:                             # behavior; anything else is
-            self._native_nc(0x2)         # a caption area -> HTCAPTION
-        except Exception:
-            pass
+            return
+        self._dx, self._dy = e.x_root - self.root.winfo_x(), \
+            e.y_root - self.root.winfo_y()
+
+    def _move(self, e):
+        now = time.monotonic()
+        if now - self._mv_t < 0.033:     # coalesce motion floods —
+            return                       # geometry() is the GIL-cost
+        self._mv_t = now
+        self.root.geometry(
+            f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
     def _rs_down(self, e):
-        try:
-            self._native_nc(0x11)        # HTBOTTOMRIGHT
-        except Exception:
-            pass
+        self._rx, self._ry = e.x_root, e.y_root
+        self._rw, self._rh = (self.root.winfo_width(),
+                              self.root.winfo_height())
+
+    def _rs_move(self, e):
+        now = time.monotonic()
+        if now - self._mv_t < 0.033:
+            return
+        self._mv_t = now
+        w = max(int(360 * self.dpi), self._rw + e.x_root - self._rx)
+        h = max(int(60 * self.dpi), self._rh + e.y_root - self._ry)
+        self.root.geometry(f"{w}x{h}")
 
     def _resized(self, e):
         """Wrap labels to the new width and clamp a minimum size —
