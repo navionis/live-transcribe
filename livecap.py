@@ -1744,14 +1744,16 @@ def main():
         diag(f"ASR model: {model_dir.name}")
         rec, asr_provider = make_recognizer(model_dir)
         diag(f"ASR provider: {asr_provider}")
-        return den, rec
-    try:
+        rec2, _ = make_recognizer(model_dir)   # 2nd instance — memory
+        return den, rec, rec2                  # is cheap, CPU isn't:
+    try:                                     # decode can't serialize
         pump = (lambda: splash.update()) if splash else             (lambda: time.sleep(0.05))
-        den, rec = run_with_pump(_load_models, pump)
+        den, rec, rec2 = run_with_pump(_load_models, pump)
     except BaseException:
         drop_splash()                    # splash must not outlive us
         raise
-    pipe = Pipeline(rec)
+    pipe = Pipeline(rec)                 # spk stream
+    pipe_mic = Pipeline(rec2)            # mic stream — own lock pool
 
     status = []
     # queues first — the cable's finished_callback reports to gui_q
@@ -1881,7 +1883,7 @@ def main():
              dict(args=(pipe, qs, gui_q, log, log_lock,
                         "spk", trans_q))),
             (asr_consumer, "asr-mic",
-             dict(args=(pipe, micasr_q, gui_q, log,
+             dict(args=(pipe_mic, micasr_q, gui_q, log,
                         log_lock, "mic"))),
             (hotkey_worker, "hotkey",
              dict(args=(gui_q,), kwargs=dict(tid_out=hk_tid))),
