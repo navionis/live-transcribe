@@ -174,15 +174,14 @@ class Resampler:
 
 
 def asr_dir() -> Path:
+    # nemotron-560ms ONLY — feature_dim=128 is baked in, so falling
+    # back to another model would decode garbage
     models = [d for d in (ROOT / "models").iterdir()
-              if (d / "tokens.txt").is_file()]
-    # nemotron-560ms: best WER that still sustains real-time on this
-    # cpu (RTF ~0.44 measured; the 160ms variant is ~1.4 — too slow)
-    models.sort(key=lambda d: (not ("nemotron" in d.name
-                                    and "560ms" in d.name), d.name))
+              if (d / "tokens.txt").is_file()
+              and "nemotron" in d.name and "560ms" in d.name]
     if not models:
-        raise SystemExit("no ASR model (with tokens.txt) under models/")
-    return models[0]
+        raise SystemExit("no nemotron-560ms model dir under models/")
+    return sorted(models)[0]
 
 
 def find_asr_dir():
@@ -210,7 +209,7 @@ def make_recognizer(model_dir: Path):
               sample_rate=SR, feature_dim=128,   # nemotron 128 mel bins
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
-              rule2_min_trailing_silence=1.2,
+              rule2_min_trailing_silence=0.8,
               rule3_min_utterance_length=20.0,
               decoding_method="greedy_search")
     # stock sherpa-onnx pip wheel is CPU-only — every non-"cpu" string
@@ -528,7 +527,7 @@ class Pipeline:
             stream = self.streams.get(tag)
             if stream is None:
                 return None
-            pad = np.zeros(int(0.75 * SR), dtype=np.float32)
+            pad = np.zeros(int(1.0 * SR), dtype=np.float32)
             stream.accept_waveform(SR, pad)
             stream.input_finished()
             while self.rec.is_ready(stream):
