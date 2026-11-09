@@ -480,7 +480,9 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
             sid, text = tq.get(timeout=0.1)
         except queue.Empty:
             continue
-        while True:                        # keep only the newest segment
+        # scrollback keeps every segment — a skipped one is a
+        # permanent gap, so only skip under a real backlog
+        while tq.qsize() > 3:
             try:
                 item = tq.get_nowait()
                 with log_lock:             # name the dropped seg id
@@ -1478,6 +1480,9 @@ class Overlay:
         geo = self._load_geo()
         w, h = geo.get("w", int(560 * self.dpi)), \
             geo.get("h", int(240 * self.dpi))
+        h = max(h, int(200 * self.dpi))  # saved geo may predate the
+                                         # scrollback — never squeeze
+                                         # it to a sliver
         x = geo.get("x", (r.winfo_screenwidth() - w) // 2)
         y = geo.get("y", r.winfo_screenheight() - h - 90)
         # clamp into the virtual screen (all monitors, incl. negative
@@ -1639,12 +1644,19 @@ class Overlay:
         """Manual drag — throttled to ~30Hz. The native HTCAPTION
         modal loop nested a Windows pump inside SendMessage, which
         re-entered Tcl and killed the process silently (console off)."""
-        if isinstance(e.widget, tk.Button) or e.widget is self._grip:
+        # toplevel bindtags deliver child-widget presses here too —
+        # arming a drag on a Text/Button press would also select the
+        # text AND move the window
+        if isinstance(e.widget, tk.Button) or e.widget in (
+                self._grip, self.view.t):
+            self._dx = None              # this press must not drag
             return
         self._dx, self._dy = e.x_root - self.root.winfo_x(), \
             e.y_root - self.root.winfo_y()
 
     def _move(self, e):
+        if getattr(self, "_dx", None) is None:
+            return
         now = time.monotonic()
         if now - self._mv_t < 0.033:     # coalesce motion floods —
             return                       # geometry() is the GIL-cost
@@ -1663,7 +1675,7 @@ class Overlay:
             return
         self._mv_t = now
         w = max(int(360 * self.dpi), self._rw + e.x_root - self._rx)
-        h = max(int(60 * self.dpi), self._rh + e.y_root - self._ry)
+        h = max(int(140 * self.dpi), self._rh + e.y_root - self._ry)
         self.root.geometry(f"{w}x{h}")
 
     def _resized(self, e):
@@ -1675,7 +1687,7 @@ class Overlay:
         for lbl in self.text_lbls:
             lbl.config(wraplength=wpl)
         w = max(int(360 * self.dpi), e.width)
-        h = max(int(60 * self.dpi), e.height)
+        h = max(int(140 * self.dpi), e.height)
         if (w, h) != (e.width, e.height):
             self.root.geometry(f"{w}x{h}")
 
@@ -1775,7 +1787,8 @@ class Overlay:
                     if tag == "spk":
                         self.seg = rest[0] if rest else 0
                         self.view.final(text, self.seg)
-                    else:
+                        self.me = ""         # stale you: line clears
+                    else:                    # when their turn ends
                         self.me = "you: " + text
                 elif ev[0] == "trans":
                     if len(ev) >= 3:
@@ -1959,7 +1972,7 @@ def main():
         diag_exc(f"thread {a.thread.name} died",
                  a.exc_type, a.exc_value, a.exc_traceback),
         put_drop(gui_q, ("state", "worker", "err", f"{a.thread.name} died")))
-    trans_q = queue.Queue(maxsize=4) if args.lang else None
+    trans_q = queue.Queue(maxsize=16) if args.lang else None
 
     in_stream, mic_sr = None, SR
     if out_stream is None:
