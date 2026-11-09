@@ -223,7 +223,9 @@ def make_recognizer(model_dir: Path):
 def make_denoiser():
     cfg = sherpa_onnx.OnlineSpeechDenoiserConfig()
     cfg.model.gtcrn.model = str(ROOT / "models" / "gtcrn_simple.onnx")
-    cfg.model.num_threads = os.cpu_count() or 1
+    cfg.model.num_threads = 1        # GTCRN is tiny — intra-op
+                                     # threads just spin-wait and
+                                     # starve the ASR of real cores
     return sherpa_onnx.OnlineSpeechDenoiser(cfg)
 
 
@@ -1250,6 +1252,9 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
     stat_t = last_chunk = time.time()
     trans_seq = [0]
     who = "them" if tag == "spk" else "you"
+    thr = 0.002 if tag == "spk" else 0.008   # mic has a noise floor
+    hang = 0.0                       # silent seconds still fed —
+                                     # > rule2 so endpoints still fire
 
     def emit(final):
         """One final, one fate: transcript log (with seg id so the
@@ -1289,6 +1294,16 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
         if isinstance(chunk, tuple):      # ("err", exc) from loopback
             put_drop(gui_q, ("err",
                              f"speaker capture failed: {chunk[1]}"))
+            continue
+        # energy gate: call sides are silent ~half the time — don't
+        # decode pure-zero loopback / idle mic; the idle_gap path
+        # above still force-finalizes a pending partial
+        rms = float(np.sqrt(np.mean(chunk * chunk)))
+        if rms > thr:
+            hang = 1.5
+        elif hang > 0:
+            hang -= len(chunk) / SR
+        if hang <= 0 and not pipe.partials.get(tag):
             continue
         try:
             t0 = time.monotonic()
