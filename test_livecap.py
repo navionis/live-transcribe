@@ -272,10 +272,6 @@ class PreflightTest(unittest.TestCase):
         for p in ("encoder", "decoder", "joiner"):
             (mdir / f"{p}-a.onnx").write_bytes(b"x")
         (models / "gtcrn_simple.onnx").write_bytes(b"x")
-        punct = models / livecap.PUNCT_DIR.name
-        punct.mkdir()
-        (punct / "model.int8.onnx").write_bytes(b"x")
-        (punct / "bpe.vocab").write_text("x")
         return mdir
 
     def test_no_models_dir(self):
@@ -293,8 +289,7 @@ class PreflightTest(unittest.TestCase):
             (mdir / "tokens.txt").write_text("x")
             (mdir / "encoder-a.onnx").write_bytes(b"x")
             names = [str(m) for m in livecap.preflight(root, mdir)]
-            for want in ("gtcrn_simple.onnx", "decoder", "joiner",
-                         "model.int8.onnx", "bpe.vocab"):
+            for want in ("gtcrn_simple.onnx", "decoder", "joiner"):
                 self.assertTrue(any(want in n for n in names), want)
             self.assertFalse(any("encoder" in n for n in names))
 
@@ -305,18 +300,6 @@ class PreflightTest(unittest.TestCase):
             (root / "models" / "gtcrn_simple.onnx").write_bytes(b"x")
             names = [str(m) for m in livecap.preflight(root, None)]
             self.assertTrue(any("ASR model dir" in n for n in names))
-
-    def test_nemotron_skips_punct(self):
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            models = root / "models"
-            mdir = models / "nemotron-x"
-            mdir.mkdir(parents=True)
-            (mdir / "tokens.txt").write_text("x")
-            for p in ("encoder", "decoder", "joiner"):
-                (mdir / f"{p}-a.onnx").write_bytes(b"x")
-            (models / "gtcrn_simple.onnx").write_bytes(b"x")
-            self.assertEqual(livecap.preflight(root, mdir), [])
 
     def test_complete_tree(self):
         with tempfile.TemporaryDirectory() as td:
@@ -976,45 +959,6 @@ class RingArmedTest(unittest.TestCase):
         self.assertEqual(r.underruns, 1)
 
 
-class PunctOutsideLockTest(unittest.TestCase):
-    """P8 — the shared punctuator must not run under the decode
-    lock, or one stream's punctuation stalls the other's decode."""
-
-    def test_punct_runs_unlocked(self):
-        seen = {}
-
-        class FakeStream:
-            def accept_waveform(self, sr, s):
-                pass
-            def input_finished(self):
-                pass
-
-        class FakeRec:
-            pipe = None
-            def create_stream(self):
-                return FakeStream()
-            def is_ready(self, s):
-                return False
-            def is_endpoint(self, s):
-                return True
-            def get_result(self, s):
-                return "WORDS HERE"
-            def reset(self, s):
-                pass
-
-        class FakePunct:
-            def add_punctuation_with_case(self, text):
-                seen["locked"] = rec.pipe.lock.locked()
-                return "Words here."
-
-        rec = FakeRec()
-        pipe = livecap.Pipeline(rec, FakePunct())
-        rec.pipe = pipe
-        self.assertEqual(pipe.feed(np.ones(64, np.float32), "spk"),
-                         "Words here.")
-        self.assertFalse(seen["locked"])
-
-
 class FindAsrDirTest(unittest.TestCase):
     """N6 — asr_dir's SystemExit is BaseException: must still yield
     the full preflight list, not crash before it."""
@@ -1069,7 +1013,7 @@ class PipelineLockTest(unittest.TestCase):
                 self._m("reset")
 
         rec = FakeRec()
-        pipe = livecap.Pipeline(rec, None)
+        pipe = livecap.Pipeline(rec)
         rec.pipe = pipe
         pipe.feed(np.ones(64, np.float32), "spk")
         pipe.flush("spk")

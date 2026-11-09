@@ -36,7 +36,6 @@ def app_root() -> Path:
 
 
 ROOT = app_root()
-PUNCT_DIR = ROOT / "models" / "sherpa-onnx-online-punct-en-2024-08-06"
 SR = 16000
 
 stop = threading.Event()
@@ -208,9 +207,7 @@ def make_recognizer(model_dir: Path):
               encoder=pick("encoder"), decoder=pick("decoder"),
               joiner=pick("joiner"),
               num_threads=os.cpu_count() or 4,
-              # nemotron uses 128 mel bins; zipformer uses 80
-              sample_rate=SR,
-              feature_dim=128 if "nemotron" in model_dir.name else 80,
+              sample_rate=SR, feature_dim=128,   # nemotron 128 mel bins
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
               rule2_min_trailing_silence=1.2,
@@ -231,13 +228,6 @@ def make_denoiser():
     return sherpa_onnx.OnlineSpeechDenoiser(cfg)
 
 
-def make_punctuator():
-    cfg = sherpa_onnx.OnlinePunctuationConfig()
-    cfg.model_config.cnn_bilstm = str(PUNCT_DIR / "model.int8.onnx")
-    cfg.model_config.bpe_vocab = str(PUNCT_DIR / "bpe.vocab")
-    cfg.model_config.num_threads = os.cpu_count() or 1
-    return sherpa_onnx.OnlinePunctuation(cfg)
-
 
 def preflight(root: Path, model_dir):
     """Every file sherpa will hard-exit on if missing — checked before
@@ -257,11 +247,6 @@ def preflight(root: Path, model_dir):
         for pat in ("encoder*.onnx", "decoder*.onnx", "joiner*.onnx"):
             if not list(model_dir.glob(pat)):
                 missing.append(model_dir / pat)
-        if "nemotron" not in model_dir.name.lower():
-            punct = models / PUNCT_DIR.name
-            for f in ("model.int8.onnx", "bpe.vocab"):
-                if not (punct / f).is_file():
-                    missing.append(punct / f)
     return missing
 
 
@@ -505,19 +490,11 @@ def translator_worker(tq, gui_q, log, log_lock, lang, email):
 # ------------------------------------------------------------------- asr
 
 class Pipeline:
-    def __init__(self, recognizer, punct):
+    def __init__(self, recognizer):
         self.rec = recognizer
-        self.punct = punct
         self.streams = {}
         self.partials = {}
         self.lock = threading.Lock()   # serialize decode across streams
-        self.plock = threading.Lock()  # shared punctuator isn't mt-safe
-
-    def _punct(self, text: str) -> str:
-        if not self.punct or not text:
-            return text
-        with self.plock:
-            return self.punct.add_punctuation_with_case(text.lower())
 
     def feed(self, samples: np.ndarray, tag: str):
         samples = np.ascontiguousarray(samples, dtype=np.float32)
@@ -541,10 +518,7 @@ class Pipeline:
             else:
                 self.partials[tag] = result_text(
                     self.rec.get_result(stream)).strip()
-        # punctuation is slow and has its own lock — holding the decode
-        # lock through it would stall the other stream
-        if text:
-            return self._punct(text)
+        return text or None
 
     def flush(self, tag):
         """Force-finalize one stream (per consumer); returns pending
@@ -561,7 +535,7 @@ class Pipeline:
                 self.rec.decode_stream(stream)
             text = result_text(self.rec.get_result(stream)).strip()
             self.streams.pop(tag, None)
-        return self._punct(text) or None
+        return text or None
 
 
 # ------------------------------------------------------ mic -> denoise ->
@@ -1334,10 +1308,6 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
                 emit(final)
             elif pipe.partials.get(tag):
                 p = pipe.partials[tag]
-                # raw zipformer partials are ALL-CAPS — sentence-case
-                # them (leave cased models like nemotron alone)
-                if p.isupper():
-                    p = p.capitalize()
                 if p != last_p.get(tag):   # dedupe identical partials
                     last_p[tag] = p
                     put_drop(gui_q, ("partial", tag, p))
@@ -1775,16 +1745,14 @@ def main():
         diag(f"ASR model: {model_dir.name}")
         rec, asr_provider = make_recognizer(model_dir)
         diag(f"ASR provider: {asr_provider}")
-        punct = (None if "nemotron" in model_dir.name.lower()
-                 else make_punctuator())
-        return den, rec, punct
+        return den, rec
     try:
         pump = (lambda: splash.update()) if splash else             (lambda: time.sleep(0.05))
-        den, rec, punct = run_with_pump(_load_models, pump)
+        den, rec = run_with_pump(_load_models, pump)
     except BaseException:
         drop_splash()                    # splash must not outlive us
         raise
-    pipe = Pipeline(rec, punct)
+    pipe = Pipeline(rec)
 
     status = []
     # queues first — the cable's finished_callback reports to gui_q
