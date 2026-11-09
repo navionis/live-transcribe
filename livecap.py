@@ -232,7 +232,7 @@ def make_recognizer(model_dir: Path):
               sample_rate=SR, feature_dim=128,   # nemotron 128 mel bins
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
-              rule2_min_trailing_silence=0.8,
+              rule2_min_trailing_silence=1.2,
               rule3_min_utterance_length=20.0,
               decoding_method="greedy_search")
     # stock sherpa-onnx pip wheel is CPU-only — every non-"cpu" string
@@ -1399,10 +1399,14 @@ class CaptionView:
         self.prev = []
 
     def _edit(self, fn):
+        # only follow the live edge if already at the bottom —
+        # scrolling up to re-read shouldn't be yanked back down
+        at_bottom = self.t.yview()[1] >= 0.999
         self.t.configure(state="normal")
         fn()
         self.t.configure(state="disabled")
-        self.t.see("end")
+        if at_bottom:
+            self.t.see("end")
 
     def partial(self, text):
         w = text.split()
@@ -1432,6 +1436,13 @@ class CaptionView:
             self.t.mark_set("pstart", "end-1c")
             if int(self.t.index("end-1c").split(".")[0]) > 300:
                 self.t.delete("1.0", "100.0")     # bound memory
+                # trimmed seg marks collapse to line 1 but stay
+                # registered — a late translation would land at the
+                # top of the view
+                for m in list(self.t.mark_names()):
+                    if m.startswith("seg") and \
+                            self.t.compare(m, "<=", "1.0"):
+                        self.t.mark_unset(m)
         self._edit(go)
 
     def translation(self, sid, text):
@@ -1521,8 +1532,7 @@ class Overlay:
         grip.bind("<Button-1>", self._rs_down)
         grip.bind("<B1-Motion>", self._rs_move)
 
-        for wdg in (r, top, self.badges, self.view.t,
-                    *self.text_lbls):
+        for wdg in (r, top, self.badges, *self.text_lbls):
             wdg.bind("<Button-1>", self._down)
             wdg.bind("<B1-Motion>", self._move)
         r.bind("<Configure>", self._resized)
@@ -1531,6 +1541,9 @@ class Overlay:
         r.bind("d", lambda e: self.tgl_den())
         r.bind("c", lambda e: self.copy_last())
         r.bind("<MouseWheel>", self._wheel)
+        # wheel over the text scrolls history (plain) or rescales
+        # (ctrl) — must break, or the root handler also fades opacity
+        self.view.t.bind("<MouseWheel>", self._text_wheel)
         signal.signal(signal.SIGINT, self._sigint)
         r.update_idletasks()
         r.report_callback_exception = lambda t, v, tb: diag_exc(
@@ -1665,6 +1678,14 @@ class Overlay:
         h = max(int(60 * self.dpi), e.height)
         if (w, h) != (e.width, e.height):
             self.root.geometry(f"{w}x{h}")
+
+    def _text_wheel(self, e):
+        if e.state & 0x4:                    # ctrl: font size
+            self._wheel(e)
+        else:                                # plain: scroll history
+            self.view.t.yview_scroll(
+                -3 if e.delta > 0 else 3, "units")
+        return "break"                       # skip root's opacity
 
     def _wheel(self, e):
         if e.state & 0x4:                        # ctrl+wheel: font size
