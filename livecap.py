@@ -509,14 +509,16 @@ class Pipeline:
             if stream is None:
                 stream = self.streams[tag] = self.rec.create_stream()
             stream.accept_waveform(SR, samples)
-            while self.rec.is_ready(stream):
-                self.rec.decode_stream(stream)
+            ran = False                  # get_result builds a string
+            while self.rec.is_ready(stream):   # — only pay for it
+                self.rec.decode_stream(stream)  # when decode ran or
+                ran = True                      # an endpoint fired
             if self.rec.is_endpoint(stream):
                 text = result_text(
                     self.rec.get_result(stream)).strip()
                 self.rec.reset(stream)
                 self.partials.pop(tag, None)
-            else:
+            elif ran:
                 self.partials[tag] = result_text(
                     self.rec.get_result(stream)).strip()
         return text or None
@@ -983,6 +985,13 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
     stat_max = stat_slow = den_fails = 0
     last_chunk = time.time()
     seen_mt = 0                        # mic_t generation marker
+    try:                                   # Pro Audio MMCSS class —
+        import ctypes                      # priority scheduling for
+        idx = ctypes.c_ulong()             # the 16ms deadline path
+        ctypes.windll.avrt.AvSetMmThreadCharacteristicsW(
+            "Pro Audio", ctypes.byref(idx))
+    except Exception:
+        pass
     while not stop.is_set():
         if state is not None:                # supervisor may have
             ring = state["ring"]             # swapped these on reopen
@@ -1168,7 +1177,9 @@ def loopback_pump(qs, gui_q):
                     backoff = 1.0
                     rep.set("speaker", "ok")
                     diag("speaker capture ok")
-                put_drop(qs, rec.record(512)[:, 0])
+                put_drop(qs, rec.record(1600)[:, 0])   # 100ms chunks —
+                # the model decodes in 560ms blocks anyway; 6x fewer
+                # Python round-trips through the pump
             except Exception as e:
                 close_rec()
                 rep.set("speaker", "err", f"capture failed: {e}")
@@ -1729,6 +1740,16 @@ def main():
 
     if not acquire_single_instance():
         raise SystemExit("livecap is already running")
+    try:
+        import ctypes
+        # 15.6ms default timer granularity ~= a whole audio frame —
+        # tighten it for the queue timeouts and waits everywhere
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        # audio path priority over everything else in the process
+        ctypes.windll.kernel32.SetPriorityClass(
+            ctypes.windll.kernel32.GetCurrentProcess(), 0x00008000)
+    except Exception:
+        pass
 
     _dpi_aware()                       # before ANY window exists
     splash = loading_splash()        # models take seconds to load —
@@ -1907,6 +1928,11 @@ def main():
         t = threading.Thread(target=tgt, daemon=True, name=name, **kw)
         t.start()
         workers.append(t)
+    try:                                 # startup allocations done —
+        import gc                        # a gen-2 sweep mid-call is a
+        gc.freeze()                      # hiccup on the audio path
+    except Exception:
+        pass
     if trans_q is not None:
         # honest disclosure: captions leave the box for translation
         status.append(("trans","info",f"{args.lang}·online"))
