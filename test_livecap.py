@@ -225,14 +225,25 @@ class ReporterTest(unittest.TestCase):
             ("state", "mic", "ok", "")])
 
 
-class BadgeTest(unittest.TestCase):
-    """H2 — warn/err get badges; ok/info fold into dot + chip."""
+class AsrThreadsTest(unittest.TestCase):
+    """Split-core helper — never oversubscribes, never returns 0."""
 
-    def test_visibility_rule(self):
-        self.assertTrue(livecap.badge_shown("warn"))
-        self.assertTrue(livecap.badge_shown("err"))
-        self.assertFalse(livecap.badge_shown("ok"))
-        self.assertFalse(livecap.badge_shown("info"))
+    def test_bounds(self):
+        self.assertEqual(livecap.asr_threads(6, 2), 3)
+        self.assertEqual(livecap.asr_threads(6, 3), 2)
+        self.assertEqual(livecap.asr_threads(6, 8), 1)   # never 0
+        self.assertLessEqual(livecap.asr_threads(6, 2) * 2, 6)
+
+
+class Sha256FileTest(unittest.TestCase):
+
+    def test_known_bytes(self):
+        import hashlib, tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "f.bin"
+            p.write_bytes(b"livecap")
+            self.assertEqual(livecap.sha256_file(p),
+                             hashlib.sha256(b"livecap").hexdigest())
 
 
 class RingResetTest(unittest.TestCase):

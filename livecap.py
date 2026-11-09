@@ -102,9 +102,10 @@ def loading_splash():
         x = (sp.winfo_screenwidth() - w) // 2
         y = sp.winfo_screenheight() - h - 90
         sp.geometry(f"{w}x{h}+{x}+{y}")
-        tk.Label(sp, text="livecap — loading models…",
-                 fg="#f9fafb", bg="#101418",
-                 font=("Segoe UI", 10)).pack(expand=True)
+        sp._lbl = tk.Label(sp, text="livecap — loading models…",
+                           fg="#f9fafb", bg="#101418",
+                           font=("Segoe UI", 10))
+        sp._lbl.pack(expand=True)
         sp.update()
         _splash[0] = sp
         return sp
@@ -176,35 +177,103 @@ class Resampler:
 def asr_dir() -> Path:
     # nemotron-560ms ONLY — feature_dim=128 is baked in, so falling
     # back to another model would decode garbage
-    models = [d for d in (ROOT / "models").iterdir()
-              if (d / "tokens.txt").is_file()
-              and "nemotron" in d.name and "560ms" in d.name]
-    if not models:
-        raise SystemExit("no nemotron-560ms model dir under models/")
-    return sorted(models)[0]
+    for mroot in model_dirs():
+        if not mroot.is_dir():
+            continue
+        models = [d for d in mroot.iterdir()
+                  if (d / "tokens.txt").is_file()
+                  and "nemotron" in d.name and "560ms" in d.name]
+        if models:
+            return sorted(models)[0]
+    raise SystemExit("no nemotron-560ms model dir under models/")
 
 
 ASR_TAR_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/"
                "download/asr-models/sherpa-onnx-nemotron-speech-"
                "streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2")
+ASR_TAR_SHA256 = ("78e2b79fcf7271553a74402a76b771b09ea40"
+                  "117a39566a79f52235b23db6358")
+
+
+def model_dirs() -> list:
+    """ASR model search order — beside the app first; a compiled exe
+    in a read-only install dir downloads to LOCALAPPDATA instead."""
+    dirs = [ROOT / "models"]
+    la = os.environ.get("LOCALAPPDATA")
+    if la:
+        dirs.append(Path(la) / "livecap" / "models")
+    return dirs
+
+
+def sha256_file(p: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
 
 
 def ensure_asr_model():
-    """Fetch nemotron-560ms into models/ if absent — runs on the
-    loader thread with the splash up (the tar is ~250MB packed)."""
-    models = ROOT / "models"
-    models.mkdir(parents=True, exist_ok=True)
-    if [d for d in models.iterdir()
-            if "nemotron" in d.name and "560ms" in d.name]:
-        return
-    import tarfile, urllib.request
-    dst = models / "nemotron-dl.tar.bz2"
-    diag("downloading nemotron-560ms model...")
-    urllib.request.urlretrieve(ASR_TAR_URL, dst)
-    with tarfile.open(dst, "r:bz2") as t:
-        t.extractall(models)
-    dst.unlink()
-    diag("nemotron model unpacked")
+    """A model counts as installed only when preflight is clean —
+    that way a half-extracted dir repairs itself on the next run.
+    Otherwise: download (pinned SHA-256, 30s socket timeout) into a
+    WRITABLE models dir, extract to a temp dir, rename each dir in."""
+    try:
+        if not preflight(ROOT, find_asr_dir()):
+            return                      # already installed
+    except SystemExit:
+        pass
+    import shutil, socket, tarfile, urllib.request
+    socket.setdefaulttimeout(30)
+    mroot = ROOT / "models"             # writable target — install
+    try:                                # dirs can be read-only
+        mroot.mkdir(parents=True, exist_ok=True)
+        probe = mroot / ".w"; probe.write_text("x"); probe.unlink()
+    except Exception:
+        mroot = (Path(os.environ["LOCALAPPDATA"])
+                 / "livecap" / "models")
+        mroot.mkdir(parents=True, exist_ok=True)
+    tmp = mroot / ".dl"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    tar = tmp / "m.tar.bz2"
+    try:
+        diag(f"downloading ASR model -> {mroot}")
+        lbl = getattr(_splash[0], "_lbl", None)
+        done = 0
+        with urllib.request.urlopen(ASR_TAR_URL) as r, \
+                open(tar, "wb") as f:
+            while blk := r.read(1 << 20):
+                f.write(blk)
+                done += len(blk)
+                if lbl is not None:
+                    try:
+                        lbl.config(text="downloading model — "
+                                        f"{done >> 20} MB")
+                    except Exception:
+                        pass
+        if sha256_file(tar) != ASR_TAR_SHA256:
+            raise SystemExit("model download corrupt (sha256)")
+        (tmp / "x").mkdir()
+        with tarfile.open(tar, "r:bz2") as tf:
+            for m in tf.getmembers():       # portable ".."/abs guard
+                if m.name.startswith(("/", "\\")) \
+                        or ".." in m.name.split("/"):
+                    raise SystemExit("unsafe member in model tar")
+            tf.extractall(tmp / "x")
+        for p in (tmp / "x").iterdir():
+            shutil.rmtree(mroot / p.name, ignore_errors=True)
+            p.replace(mroot / p.name)
+        diag("nemotron model unpacked")
+    except SystemExit:
+        raise
+    except Exception as e:
+        raise SystemExit(f"model download failed: {e}\n"
+                         f"  url: {ASR_TAR_URL}\n"
+                         f"  to:  {mroot}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def find_asr_dir():
@@ -217,7 +286,13 @@ def find_asr_dir():
         return None
 
 
-def make_recognizer(model_dir: Path):
+def asr_threads(cpu: int, n: int) -> int:
+    """Split cores between recognizers — two cpu_count pools would
+    oversubscribe (each spins its own intra-op threads)."""
+    return max(1, cpu // n)
+
+
+def make_recognizer(model_dir: Path, threads: int = 0):
     def pick(prefix):
         for pat in (f"{prefix}*.int8.onnx", f"{prefix}*.onnx"):
             fs = sorted(model_dir.glob(pat))
@@ -228,7 +303,7 @@ def make_recognizer(model_dir: Path):
     kw = dict(tokens=str(model_dir / "tokens.txt"),
               encoder=pick("encoder"), decoder=pick("decoder"),
               joiner=pick("joiner"),
-              num_threads=os.cpu_count() or 4,
+              num_threads=threads or os.cpu_count() or 4,
               sample_rate=SR, feature_dim=128,   # nemotron 128 mel bins
               enable_endpoint_detection=True,
               rule1_min_trailing_silence=2.4,
@@ -388,12 +463,6 @@ class Reporter:
             if self.last.get(comp) != (lvl, msg):
                 self.last[comp] = (lvl, msg)
                 put_drop(self.q, ("state", comp, lvl, msg))
-
-
-def badge_shown(lvl: str) -> bool:
-    """Only warn/err get badges — ok folds into the dot, info into the
-    single compact chip, so the status row stays inside the window."""
-    return lvl in ("warn", "err")
 
 
 _BADGE_PRIORITY = ("mute", "cable", "mic", "speaker")
@@ -808,29 +877,26 @@ def dead_cb(state, comp, rep, msg):
 
 def _sd_reinit(state, rep):
     """PortAudio's device list is frozen at Pa_Initialize — a reinit
-    needs every stream closed first. Dropping the live stream costs a
-    ~1s passthrough gap, but a replugged device is INVISIBLE without
-    it (frozen list returns stale indices forever). Whatever we close
-    is marked dead so the supervisor reopens it next pass."""
+    re-enumerates it. Only DEAD streams are closed; a healthy stream's
+    Pa handle is independent of the device list and keeps playing
+    through re-enumeration, so no passthrough gap."""
     now = time.time()
     if now - state.get("reinit_t", 0.0) < 30.0:
         return False                 # one global cooldown: mic and cable
     state["reinit_t"] = now          # failures can't bounce each other
-    live = {"in": state.get("in"), "out": state.get("out")}
-    if live["out"] is not None:
-        state["out"], state["ring"] = None, None
-    if live["in"] is not None:
-        state["in"] = None
-    for st in live.values():
-        if st is not None:
+    # close only streams already flagged dead — a healthy stream's
+    # Pa handle is independent of the host-API device list and keeps
+    # playing through re-enumeration (no passthrough gap)
+    for k, dead in (("in", "mic_dead"), ("out", "cable_dead")):
+        st = state.get(k)
+        if st is not None and state.get(dead):
             try:
                 st.stop(); st.close()
             except Exception:
                 pass
-    if live["out"] is not None:
-        mark_dead(state, "cable", rep, "cable closed for reinit")
-    if live["in"] is not None:
-        mark_dead(state, "mic", rep, "mic closed for reinit")
+            state[k] = None
+            if k == "out":
+                state["ring"] = None
     try:
         sd._terminate()
         sd._initialize()
@@ -919,7 +985,14 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 if idx is None:
                     raise RuntimeError("no mic")
                 st, msr = open_mic_fn(idx)
-                st.start()
+                try:
+                    st.start()
+                except Exception:
+                    try:               # a failed start leaks the
+                        st.close()     # stream handle — close it
+                    except Exception:
+                        pass
+                    raise
                 state["in"] = st
                 state["mic_sr"], state["mic_dead"] = msr, False
                 state["mic_t"] = time.time()   # grace before stall
@@ -929,6 +1002,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 diag(f"mic reopened: dev{idx} {msr}Hz")
             except Exception as e:
                 fails["mic"] += 1
+                rep.set("mic", "err", f"retry {fails['mic']}")
                 if fails["mic"] >= 3:
                     _sd_reinit(state, rep)
                 next_try["mic"] = now + backoff["mic"]
@@ -948,7 +1022,14 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 ring2, st2, csr = open_cable_fn()
                 if st2 is None:
                     raise RuntimeError("all cable candidates failed")
-                st2.start()
+                try:
+                    st2.start()
+                except Exception:
+                    try:
+                        st2.close()
+                    except Exception:
+                        pass
+                    raise
                 state["out"] = st2
                 state["ring"], state["cable_sr"] = ring2, csr
                 state["cable_dead"] = False
@@ -959,6 +1040,7 @@ def stream_supervisor(state, ev, gui_q, den, mic_q,
                 diag(f"cable reopened: {csr}Hz")
             except Exception as e:
                 fails["cable"] += 1
+                rep.set("cable", "err", f"retry {fails['cable']}")
                 if fails["cable"] >= 3:
                     _sd_reinit(state, rep)
                 next_try["cable"] = now + backoff["cable"]
@@ -1009,6 +1091,8 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
     stat_t, stat_dn, stat_ms = time.time(), 0, 0.0
     stat_max = stat_slow = den_fails = 0
     last_chunk = time.time()
+    if (state or {}).get("mic_dead"):    # reopened-mic grace — no
+        last_chunk += 10                 # false "no mic input" flash
     seen_mt = 0                        # mic_t generation marker
     try:                                   # Pro Audio MMCSS class —
         import ctypes                      # priority scheduling for
@@ -1135,7 +1219,7 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
                     if abs(rs.trim) > 0.0009 and abs(
                             ring.fill() - target) > 0.01 * cur_sr[1]:
                         rep.set("cable", "err", "clock skew saturating")
-                    else:
+                    elif not (state or {}).get("cable_dead"):
                         rep.set("cable", "ok")
                 diag(voice_stat(ring, mic_q, micasr_q,
                                 stat_ms / max(stat_dn, 1), stat_max,
@@ -1224,7 +1308,7 @@ def loopback_pump(qs, gui_q):
 
 # ----------------------------------------------------------------- hotkeys
 
-def hotkey_worker(gui_q, tid_out=None):
+def hotkey_worker(gui_q, mute=None, den_off=None, tid_out=None):
     """Global hotkeys — tk bind() only fires while the overlay has
     focus, which mid-call it never does. RegisterHotKey(NULL hwnd)
     posts WM_HOTKEY to THIS thread's queue; a GetMessage loop drains
@@ -1256,10 +1340,6 @@ def hotkey_worker(gui_q, tid_out=None):
                      f"err {ctypes.get_last_error()}")
         if not registered:
             return
-        # quiet chip so the chords are discoverable in-session
-        put_drop(gui_q, ("state", "hk", "info",
-                         "·".join(f"C-A-{HK[i][1]}"
-                                  for i in registered)))
         diag("hotkeys registered: "
              + ", ".join(HK[i][0] for i in registered))
         try:
@@ -1268,7 +1348,13 @@ def hotkey_worker(gui_q, tid_out=None):
                 if msg.message == WM_HOTKEY:
                     hk = HK.get(msg.wParam)
                     if hk:
-                        put_drop(gui_q, ("hotkey", hk[0]))
+                        # flip the flag HERE — the overlay only syncs
+                        # its labels, so a dead Tk can't leave state
+                        # and UI disagreeing
+                        ev = {"mute": mute, "den": den_off}.get(hk[0])
+                        if ev is not None:
+                            (ev.clear if ev.is_set() else ev.set)()
+                        put_drop(gui_q, ("sync", hk[0]))
         finally:
             for hkid in registered:
                 u.UnregisterHotKey(None, hkid)
@@ -1283,6 +1369,12 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
     """One stream, one consumer thread — mic can't starve behind
     speaker decode on CPU-only boxes. tag: 'spk' or 'mic'."""
     rep = Reporter(gui_q)
+    try:                               # decode yields to the audio
+        import ctypes                  # threads — BELOW_NORMAL
+        ctypes.windll.kernel32.SetThreadPriority(
+            ctypes.windll.kernel32.GetCurrentThread(), -1)
+    except Exception:
+        pass
     last_p = {}
     stat_a = stat_d = 0.0                  # audio seconds, decode seconds
     stat_t = last_chunk = time.time()
@@ -1291,6 +1383,10 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
     thr = 0.002 if tag == "spk" else 0.008   # mic has a noise floor
     hang = 0.0                       # silent seconds still fed —
                                      # > rule2 so endpoints still fire
+    floor = 0.01                     # mic EMA noise floor
+    preroll = deque(maxlen=16)       # ~250ms of recent chunks —
+                                     # fed on gate-open so onsets
+                                     # aren't clipped
 
     def emit(final):
         """One final, one fate: transcript log (with seg id so the
@@ -1335,10 +1431,19 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
         # decode pure-zero loopback / idle mic; the idle_gap path
         # above still force-finalizes a pending partial
         rms = float(np.sqrt(np.mean(chunk * chunk)))
-        if rms > thr:
+        if tag == "mic" and hang <= 0:   # adaptive floor — EMA of
+            floor = 0.98 * floor + 0.02 * rms   # closed-gate chunks
+        thr_m = max(0.004, 3 * floor) if tag == "mic" else thr
+        if rms > thr_m:
+            if hang <= 0:                # gate just opened — feed
+                for c in preroll:        # the ~250ms it missed
+                    f = pipe.feed(c, tag)
+                    if f:
+                        emit(f)
             hang = 1.5
         elif hang > 0:
             hang -= len(chunk) / SR
+        preroll.append(chunk)
         if hang <= 0 and not pipe.partials.get(tag):
             continue
         try:
@@ -1468,6 +1573,8 @@ class Overlay:
         self.finals = deque(maxlen=50)
         self._shown = {}                   # last text pushed per label
         self._mv_t = 0.0                   # drag/resize throttle
+        self._wpl = 0                      # last applied wraplength
+        self.me_t = 0.0                    # last you: update time
         self.fs, self.alpha = 11, 0.85
         _dpi_aware()
         r = self.root = tk.Tk()
@@ -1505,6 +1612,9 @@ class Overlay:
 
         top = tk.Frame(r, bg=BG)
         top.pack(fill="x", pady=(0, 2))
+        # drag handle — the Text area itself is for selection, not drag
+        tk.Label(top, bg=BG, fg=MUTE, font=("Segoe UI", 9),
+                 text="≡ ").pack(side="left")
         # buttons pack first so a wide badge row can never clip them
         if self.mic_active:
             self.mute_lbl = self._btn(top, "mic: on", self.tgl_mute)
@@ -1632,9 +1742,10 @@ class Overlay:
         probs = [f"{c}: {self.state_txt.get(c) or l}"
                  for c, l in self.state_lvl.items()
                  if l in ("warn", "err")]
-        if probs:
-            self.esc_lbl.config(text=" · ".join(probs))
-            self.root.after(3500, self._esc_clear)
+        self.esc_lbl.config(
+            text=" · ".join(probs)
+            or "ctrl+alt+m mute · ctrl+alt+d denoise")
+        self.root.after(3500, self._esc_clear)
 
     def _sigint(self, *_):
         # Tcl's event wait swallows Ctrl+C; after() wakes the loop
@@ -1687,8 +1798,10 @@ class Overlay:
         if e.widget is not self.root:
             return
         wpl = e.width - int(24 * self.dpi)
-        for lbl in self.text_lbls:
-            lbl.config(wraplength=wpl)
+        if wpl != self._wpl:               # skip a same-width reflow
+            self._wpl = wpl
+            for lbl in self.text_lbls:
+                lbl.config(wraplength=wpl)
         w = max(int(360 * self.dpi), e.width)
         h = max(int(140 * self.dpi), e.height)
         if (w, h) != (e.width, e.height):
@@ -1784,6 +1897,7 @@ class Overlay:
                         pend = text      # coalesced — only the
                     else:                # newest partial renders
                         self.me = "you: " + text
+                        self.me_t = time.time()
                 elif ev[0] == "final":
                     _, tag, text, *rest = ev
                     self.finals.append(
@@ -1792,19 +1906,35 @@ class Overlay:
                         pend = None          # final supersedes
                         self.seg = rest[0] if rest else 0
                         self.view.final(text, self.seg)
-                        self.me = ""         # stale you: line clears
+                        if time.time() - self.me_t > 3:
+                            self.me = ""     # stale you: clears only
+                                             # if you're not mid-line
                     else:                    # when their turn ends
                         self.me = "you: " + text
+                        self.me_t = time.time()
                 elif ev[0] == "trans":
                     if len(ev) >= 3:
                         # attaches to its own segment line — a stale
                         # seg finds no mark and is dropped
                         self.view.translation(ev[2], ev[1])
-                elif ev[0] == "hotkey":
+                elif ev[0] == "sync":
+                    # the hotkey worker already flipped the flag —
+                    # just reflect it in labels/badges
                     if ev[1] == "mute":
-                        self.tgl_mute()
-                    elif ev[1] == "den":
-                        self.tgl_den()
+                        muted = self.mute.is_set()
+                        if self.mic_active:
+                            self.mute_lbl.config(
+                                text="mic: muted" if muted
+                                else "mic: on")
+                        if muted:
+                            self._set_state("mute", "err", "MIC MUTED")
+                        else:
+                            self._set_state("mute", "ok")
+                    elif ev[1] == "den" and self.mic_active:
+                        self.den_lbl.config(
+                            text="denoise: off"
+                            if self.den_off.is_set()
+                            else "denoise: on")
                 elif ev[0] == "state":
                     # badge/dot only — never overwrite the caption
                     self._set_state(ev[1], ev[2],
@@ -1867,9 +1997,6 @@ def main():
         # 15.6ms default timer granularity ~= a whole audio frame —
         # tighten it for the queue timeouts and waits everywhere
         ctypes.windll.winmm.timeBeginPeriod(1)
-        # audio path priority over everything else in the process
-        ctypes.windll.kernel32.SetPriorityClass(
-            ctypes.windll.kernel32.GetCurrentProcess(), 0x00008000)
     except Exception:
         pass
 
@@ -1900,9 +2027,10 @@ def main():
                              + "\n  ".join(str(m) for m in missing))
         den = make_denoiser()
         diag(f"ASR model: {model_dir.name}")
-        rec, asr_provider = make_recognizer(model_dir)
+        nth = asr_threads(os.cpu_count() or 4, 2)
+        rec, asr_provider = make_recognizer(model_dir, nth)
         diag(f"ASR provider: {asr_provider}")
-        rec2, _ = make_recognizer(model_dir)   # 2nd instance — memory
+        rec2, _ = make_recognizer(model_dir, nth)   # 2nd instance — memory
         return den, rec, rec2                  # is cheap, CPU isn't:
     try:                                     # decode can't serialize
         pump = (lambda: splash.update()) if splash else             (lambda: time.sleep(0.05))
@@ -1995,7 +2123,14 @@ def main():
                 mic_idx, den, mic_q, gui_q,
                 dead=dead_cb(state, "mic", rep,
                              "mic stream stopped"))
-            st.start()
+            try:
+                st.start()
+            except Exception:
+                try:                     # a failed start leaks the
+                    st.close()           # stream handle — close it
+                except Exception:
+                    pass
+                raise
             in_stream = st                 # assign only after start()
             state["in"], state["mic_sr"] = st, mic_sr
             status.append(("mic","ok","mic ✓"))
@@ -2044,7 +2179,8 @@ def main():
              dict(args=(pipe_mic, micasr_q, gui_q, log,
                         log_lock, "mic"))),
             (hotkey_worker, "hotkey",
-             dict(args=(gui_q,), kwargs=dict(tid_out=hk_tid))),
+             dict(args=(gui_q,), kwargs=dict(
+                 mute=mute, den_off=den_off, tid_out=hk_tid))),
     ]
     for tgt, name, kw in worker_defs:
         t = threading.Thread(target=tgt, daemon=True, name=name, **kw)
@@ -2065,6 +2201,7 @@ def main():
                                    args.trans_email))
         t.start()
         workers.append(t)
+    status.append(("log","info","log"))      # disclosure chip
 
     diag("livecap running — mic -> denoise -> cable, captions for both")
     try:
