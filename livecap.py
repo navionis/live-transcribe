@@ -1544,7 +1544,10 @@ class Overlay:
         r.bind("<Escape>", self._esc)
         r.bind("m", lambda e: self.tgl_mute())
         r.bind("d", lambda e: self.tgl_den())
-        r.bind("c", lambda e: self.copy_last())
+        # Text's own Ctrl+C must win — 'c' alone still copies the
+        # last caption; extra modifiers skip our handler
+        r.bind("c", lambda e: None if e.state & 0x4 else
+                 self.copy_last())
         r.bind("<MouseWheel>", self._wheel)
         # wheel over the text scrolls history (plain) or rescales
         # (ctrl) — must break, or the root handler also fades opacity
@@ -1770,21 +1773,23 @@ class Overlay:
         if stop.is_set():
             return
         dirty = False
-        try:
-            while True:
+        pend = None                        # newest queued spk partial
+        try:                               # — renders once after the
+            while True:                    # drain, not per event
                 ev = self.q.get_nowait()
                 dirty = True
                 if ev[0] == "partial":
                     _, tag, text = ev
                     if tag == "spk":
-                        self.view.partial(text)
-                    else:
+                        pend = text      # coalesced — only the
+                    else:                # newest partial renders
                         self.me = "you: " + text
                 elif ev[0] == "final":
                     _, tag, text, *rest = ev
                     self.finals.append(
                         ("them" if tag == "spk" else "you") + ": " + text)
                     if tag == "spk":
+                        pend = None          # final supersedes
                         self.seg = rest[0] if rest else 0
                         self.view.final(text, self.seg)
                         self.me = ""         # stale you: line clears
@@ -1811,6 +1816,8 @@ class Overlay:
             pass
         except Exception:                    # one bad event must not
             pass                             # kill the drain loop
+        if pend is not None:
+            self.view.partial(pend)
         if dirty:
             zwsp = "\u200b"
             # me_now is a label; config() re-lays out even for
