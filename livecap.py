@@ -1378,15 +1378,79 @@ else:
 CFG = LOGS / "livecap-window.json"
 
 
+class CaptionView:
+    """Append-only scrollback. Finals are permanent lines; the live
+    partial is one tail region. Words two consecutive partials agree
+    on are 'stable' (bright); the revising tail is dim — a word you
+    already read never changes underneath you."""
+
+    def __init__(self, parent, lines=6, fs=11):
+        t = self.t = tk.Text(
+            parent, bg=BG, fg=TXT, bd=0, highlightthickness=0,
+            wrap="word", height=lines, font=("Segoe UI", fs),
+            padx=12, pady=2, spacing3=3, cursor="arrow",
+            state="disabled")
+        t.tag_configure("stable", foreground=TXT)
+        t.tag_configure("tail", foreground=DIM)
+        t.tag_configure("tr", foreground=ACC,
+                        font=("Segoe UI", fs - 3))
+        t.mark_set("pstart", "end-1c")
+        t.mark_gravity("pstart", "left")
+        self.prev = []
+
+    def _edit(self, fn):
+        self.t.configure(state="normal")
+        fn()
+        self.t.configure(state="disabled")
+        self.t.see("end")
+
+    def partial(self, text):
+        w = text.split()
+        k = 0
+        while (k < min(len(w), len(self.prev))
+               and w[k] == self.prev[k]):
+            k += 1
+        self.prev = w
+
+        def go():
+            self.t.delete("pstart", "end-1c")
+            if k:
+                self.t.insert("end-1c", " ".join(w[:k]) + " ", "stable")
+            if k < len(w):
+                self.t.insert("end-1c", " ".join(w[k:]), "tail")
+        self._edit(go)
+
+    def final(self, text, sid):
+        self.prev = []
+
+        def go():
+            self.t.delete("pstart", "end-1c")
+            self.t.insert("end-1c", text, "stable")
+            self.t.mark_set(f"seg{sid}", "end-1c")
+            self.t.mark_gravity(f"seg{sid}", "left")
+            self.t.insert("end-1c", "\n")
+            self.t.mark_set("pstart", "end-1c")
+            if int(self.t.index("end-1c").split(".")[0]) > 300:
+                self.t.delete("1.0", "100.0")     # bound memory
+        self._edit(go)
+
+    def translation(self, sid, text):
+        m = f"seg{sid}"
+        if m in self.t.mark_names():
+            self._edit(lambda: self.t.insert(m, "\n" + text, "tr"))
+
+    def set_font(self, fs):
+        self.t.configure(font=("Segoe UI", fs))
+        self.t.tag_configure("tr", font=("Segoe UI", fs - 3))
+
+
 class Overlay:
     def __init__(self, gui_q, status_items, mute, den_off,
                  mic_active=True):
         self.q = gui_q
         self.mute, self.den_off = mute, den_off
         self.mic_active = mic_active
-        self.them = {"last": "", "now": ""}
         self.me = ""
-        self.tr = ""
         self.seg = 0
         self.finals = deque(maxlen=50)
         self._shown = {}                   # last text pushed per label
@@ -1402,7 +1466,7 @@ class Overlay:
         r.configure(bg=BG)
         geo = self._load_geo()
         w, h = geo.get("w", int(560 * self.dpi)), \
-            geo.get("h", int(100 * self.dpi))
+            geo.get("h", int(240 * self.dpi))
         x = geo.get("x", (r.winfo_screenwidth() - w) // 2)
         y = geo.get("y", r.winfo_screenheight() - h - 90)
         # clamp into the virtual screen (all monitors, incl. negative
@@ -1444,14 +1508,12 @@ class Overlay:
             self._set_state(comp, lvl, txt)
 
         self.esc_lbl = mk(fg="#fbbf24", font=("Segoe UI", 9))
-        self.them_last = mk(fg=DIM, font=("Segoe UI", 10))
-        self.trans = mk(fg=ACC, font=("Segoe UI", self.fs - 3))
-        self.them_now = mk(fg=TXT, font=("Segoe UI", 11))
+        self.view = CaptionView(r, lines=6, fs=self.fs)
         self.me_now = mk(fg=DIM, font=("Segoe UI", 10))
-        self.text_lbls = (self.esc_lbl, self.them_last, self.trans,
-                          self.them_now, self.me_now)
-        for lbl in self.text_lbls:
-            lbl.pack(fill="x", padx=12)
+        self.text_lbls = (self.esc_lbl, self.me_now)
+        self.esc_lbl.pack(fill="x", padx=12)
+        self.view.t.pack(fill="both", expand=True)
+        self.me_now.pack(fill="x", padx=12)
         grip = mk(fg=MUTE, font=("Segoe UI", 8), text="◢",
                   cursor="size_nw_se")
         self._grip = grip
@@ -1459,7 +1521,8 @@ class Overlay:
         grip.bind("<Button-1>", self._rs_down)
         grip.bind("<B1-Motion>", self._rs_move)
 
-        for wdg in (r, top, self.badges, *self.text_lbls):
+        for wdg in (r, top, self.badges, self.view.t,
+                    *self.text_lbls):
             wdg.bind("<Button-1>", self._down)
             wdg.bind("<B1-Motion>", self._move)
         r.bind("<Configure>", self._resized)
@@ -1606,9 +1669,7 @@ class Overlay:
     def _wheel(self, e):
         if e.state & 0x4:                        # ctrl+wheel: font size
             self.fs = max(8, min(20, self.fs + (1 if e.delta > 0 else -1)))
-            self.them_last.config(font=("Segoe UI", self.fs - 1))
-            self.them_now.config(font=("Segoe UI", self.fs))
-            self.trans.config(font=("Segoe UI", self.fs - 3))
+            self.view.set_font(self.fs)
             self.me_now.config(font=("Segoe UI", self.fs - 1))
         else:                                    # wheel: opacity
             self.alpha = max(0.35, min(1.0,
@@ -1654,7 +1715,8 @@ class Overlay:
 
     def copy_last(self):
         self.root.clipboard_clear()
-        self.root.clipboard_append(self.them["now"] or self.them["last"])
+        self.root.clipboard_append(self.finals[-1]
+                                   if self.finals else "")
 
     def copy_all(self):
         self.root.clipboard_clear()
@@ -1682,7 +1744,7 @@ class Overlay:
                 if ev[0] == "partial":
                     _, tag, text = ev
                     if tag == "spk":
-                        self.them["now"] = text
+                        self.view.partial(text)
                     else:
                         self.me = "you: " + text
                 elif ev[0] == "final":
@@ -1690,15 +1752,15 @@ class Overlay:
                     self.finals.append(
                         ("them" if tag == "spk" else "you") + ": " + text)
                     if tag == "spk":
-                        self.them["last"], self.them["now"] = text, ""
                         self.seg = rest[0] if rest else 0
-                        self.tr = ""         # the old seg's
-                                             # translation is stale
+                        self.view.final(text, self.seg)
                     else:
                         self.me = "you: " + text
                 elif ev[0] == "trans":
-                    if len(ev) < 3 or ev[2] == self.seg:
-                        self.tr = ev[1]      # stale segments dropped
+                    if len(ev) >= 3:
+                        # attaches to its own segment line — a stale
+                        # seg finds no mark and is dropped
+                        self.view.translation(ev[2], ev[1])
                 elif ev[0] == "hotkey":
                     if ev[1] == "mute":
                         self.tgl_mute()
@@ -1709,7 +1771,7 @@ class Overlay:
                     self._set_state(ev[1], ev[2],
                                     ev[3] if len(ev) > 3 else "")
                 elif ev[0] == "err":
-                    self.them["now"] = str(ev[1])
+                    self.view.partial(str(ev[1]))
                     self._set_state("worker", "err", str(ev[1])[:40])
         except queue.Empty:
             pass
@@ -1717,26 +1779,12 @@ class Overlay:
             pass                             # kill the drain loop
         if dirty:
             zwsp = "\u200b"
-            for lbl, txt in ((self.them_last, self.them["last"]),
-                             (self.them_now, self.them["now"]),
-                             (self.trans, self.tr),
-                             (self.me_now, self.me)):
-                txt = txt or zwsp
-                # config() re-lays out even for identical text —
-                # skip it when nothing changed (e.g. a badge event)
-                if self._shown.get(lbl) != txt:
-                    self._shown[lbl] = txt
-                    lbl.config(text=txt)
-            # grow to fit wrapped text (never auto-shrinks) — anchored
-            # at the bottom edge so growth can't leave the screen
-            self.root.update_idletasks()
-            rh = self.root.winfo_reqheight()
-            h0 = self.root.winfo_height()
-            if rh > h0 + 2:
-                new_y = max(self._vtop,
-                            self.root.winfo_y() + h0 - rh)
-                self.root.geometry(f"{self.root.winfo_width()}x{rh}"
-                                   f"+{self.root.winfo_x()}+{new_y}")
+            # me_now is a label; config() re-lays out even for
+            # identical text — skip it when nothing changed
+            txt = self.me or zwsp
+            if self._shown.get(self.me_now) != txt:
+                self._shown[self.me_now] = txt
+                self.me_now.config(text=txt)
 
     def close(self):
         if getattr(self, "_closed", False):   # Esc x2 + Ctrl+C can
