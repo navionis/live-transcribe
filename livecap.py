@@ -184,6 +184,29 @@ def asr_dir() -> Path:
     return sorted(models)[0]
 
 
+ASR_TAR_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/"
+               "download/asr-models/sherpa-onnx-nemotron-speech-"
+               "streaming-en-0.6b-560ms-int8-2026-04-25.tar.bz2")
+
+
+def ensure_asr_model():
+    """Fetch nemotron-560ms into models/ if absent — runs on the
+    loader thread with the splash up (the tar is ~250MB packed)."""
+    models = ROOT / "models"
+    models.mkdir(parents=True, exist_ok=True)
+    if [d for d in models.iterdir()
+            if "nemotron" in d.name and "560ms" in d.name]:
+        return
+    import tarfile, urllib.request
+    dst = models / "nemotron-dl.tar.bz2"
+    diag("downloading nemotron-560ms model...")
+    urllib.request.urlretrieve(ASR_TAR_URL, dst)
+    with tarfile.open(dst, "r:bz2") as t:
+        t.extractall(models)
+    dst.unlink()
+    diag("nemotron model unpacked")
+
+
 def find_asr_dir():
     """asr_dir() that returns None instead of raising — SystemExit is
     BaseException, not Exception, so it needs naming explicitly.
@@ -1767,15 +1790,15 @@ def main():
     _diag_log[0] = open(dp, "a", encoding="utf-8", buffering=1)
     sys.excepthook = lambda t, v, tb: diag_exc("fatal", t, v, tb)
 
-    # preflight BEFORE any sherpa call — a missing file exits the
-    # process silently from native code when the console is hidden
-    model_dir = find_asr_dir()
-    missing = preflight(ROOT, model_dir)
-    if missing:
-        raise SystemExit("missing model files:\n  "
-                         + "\n  ".join(str(m) for m in missing))
-
     def _load_models():
+        ensure_asr_model()               # downloads if missing —
+        model_dir = find_asr_dir()       # splash stays up via pump
+        # preflight before any sherpa call — a missing file exits
+        # silently from native code when the console is hidden
+        missing = preflight(ROOT, model_dir)
+        if missing:
+            raise SystemExit("missing model files:\n  "
+                             + "\n  ".join(str(m) for m in missing))
         den = make_denoiser()
         diag(f"ASR model: {model_dir.name}")
         rec, asr_provider = make_recognizer(model_dir)
