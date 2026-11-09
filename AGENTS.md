@@ -71,8 +71,13 @@ main thread        tkinter Overlay, after(30ms) drains gui_q
   trailing silence, 20s utterance cap; `Pipeline.flush()` pads 1.0s
   silence before `input_finished()` (560ms chunk + context)
 - energy gate skips decode during silence (hang 1.5s > rule2); a
-  ~250ms pre-roll deque feeds the onset on gate-open; mic threshold
-  adapts: max(0.004, 3 * EMA noise floor)
+  ~250ms pre-roll deque of SKIPPED chunks feeds the onset once on
+  gate-open; mic floor is slow-rise (drops fast to rms, rises at
+  0.2%) so soft speech can't lift its own threshold
+- the mic opens INDEPENDENT of the cable — you: captions need only
+  the mic, passthrough needs the cable; `_sd_reinit` fires only when
+  `dev_sig()` (COM-safe mic+speaker id set) actually changed, and
+  closes ALL streams (~1s gap)
 - hotkeys Ctrl+Alt+M / Ctrl+Alt+D — the worker flips mute/den_off
   itself and pushes ("sync", ...) so a dead Tk can't desync state
 - [you] captions tap the RAW mic chunk — denoise eats consonants

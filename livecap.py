@@ -234,6 +234,7 @@ def ensure_asr_model():
     WRITABLE models dir, extract to a temp dir, rename each dir in."""
     try:
         if not asr_missing(find_asr_dir()):
+            _dl["done"] = True
             return                      # already installed
     except SystemExit:
         pass
@@ -244,8 +245,8 @@ def ensure_asr_model():
         mroot.mkdir(parents=True, exist_ok=True)
         probe = mroot / ".w"; probe.write_text("x"); probe.unlink()
     except Exception:
-        mroot = (Path(os.environ["LOCALAPPDATA"])
-                 / "livecap" / "models")
+        mroot = (Path(os.environ.get("LOCALAPPDATA")
+                      or str(Path.home())) / "livecap" / "models")
         mroot.mkdir(parents=True, exist_ok=True)
     tmp = mroot / ".dl"
     shutil.rmtree(tmp, ignore_errors=True)
@@ -268,7 +269,8 @@ def ensure_asr_model():
         with tarfile.open(tar, "r:bz2") as tf:
             for m in tf.getmembers():       # portable ".."/abs guard
                 if m.name.startswith(("/", "\\")) \
-                        or ".." in m.name.split("/"):
+                        or ".." in m.name.split("/") \
+                        or m.issym() or m.islnk():
                     raise SystemExit("unsafe member in model tar")
             kw = ({"filter": "data"}
                   if hasattr(tarfile, "data_filter") else {})
@@ -276,6 +278,7 @@ def ensure_asr_model():
         for p in (tmp / "x").iterdir():
             shutil.rmtree(mroot / p.name, ignore_errors=True)
             p.replace(mroot / p.name)
+        _dl["done"] = True
         diag("nemotron model unpacked")
     except SystemExit:
         raise
@@ -886,6 +889,28 @@ def dead_cb(state, comp, rep, msg):
     return cb
 
 
+def dev_sig():
+    """Device-set signature — soundcard needs COM on the calling
+    thread. Reinit only matters when the OS device set changed;
+    comparing before/after kills the 30s reinit bounce."""
+    import ctypes
+    ci = False
+    try:
+        ctypes.windll.ole32.CoInitialize(None)
+        ci = True
+    except Exception:
+        pass
+    try:
+        import soundcard as sc
+        return (frozenset(m.id for m in sc.all_microphones())
+                | frozenset(s.id for s in sc.all_speakers()))
+    except Exception:
+        return None
+    finally:
+        if ci:
+            ctypes.windll.ole32.CoUninitialize()
+
+
 def _sd_reinit(state, rep):
     """PortAudio's device list is frozen at Pa_Initialize — and
     Pa_Terminate kills EVERY open stream, so leaving one live hands
@@ -896,6 +921,10 @@ def _sd_reinit(state, rep):
     if now - state.get("reinit_t", 0.0) < 30.0:
         return False                 # one global cooldown: mic and cable
     state["reinit_t"] = now          # failures can't bounce each other
+    sig = dev_sig()                  # an unchanged device set means a
+    if sig is not None and sig == state.get("sig"):   # reinit can't
+        return False                 # help — don't bounce streams
+    state["sig"] = sig
     for k in ("in", "out"):
         st = state.get(k)
         if st is not None:
@@ -1152,7 +1181,9 @@ def voice_engine(mic_q, den, ring, micasr_q, mute, den_off, gui_q,
         try:
             x = mic_q.get(timeout=0.02)
             last_chunk = time.time()
-            rep.set("mic", "ok")             # Q12: recovery clears
+            if not (state or {}).get("mic_dead"):
+                rep.set("mic", "ok")         # stale pre-death chunks
+                                             # must not clear badges
         except queue.Empty:                  # the badge even muted
             # chunks keep arriving even while muted — a stall means
             # the device is gone, not silent
@@ -1400,7 +1431,7 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
     thr = 0.002 if tag == "spk" else 0.008   # mic has a noise floor
     hang = 0.0                       # silent seconds still fed —
                                      # > rule2 so endpoints still fire
-    floor = 0.01                     # mic EMA noise floor
+    floor = 0.003                    # mic noise floor (slow-rise)
     pre, pre_n = deque(), 0          # ~250ms of SKIPPED chunks — fed
                                      # once on gate-open so onsets
                                      # aren't clipped
@@ -1448,15 +1479,22 @@ def asr_consumer(pipe, q, gui_q, log, log_lock, tag, trans_q=None,
         # decode pure-zero loopback / idle mic; the idle_gap path
         # above still force-finalizes a pending partial
         rms = float(np.sqrt(np.mean(chunk * chunk)))
-        if tag == "mic" and hang <= 0:   # adaptive floor — EMA of
-            floor = 0.98 * floor + 0.02 * rms   # closed-gate chunks
+        if tag == "mic" and hang <= 0:   # slow-rise floor — drops
+            floor = rms if rms < floor \
+                else floor + (rms - floor) * 0.002   # fast so soft
+        # speech can't pull the threshold up to itself
         thr_m = max(0.004, 3 * floor) if tag == "mic" else thr
         if rms > thr_m:
             if hang <= 0:                # gate just opened — feed
                 for c in pre:            # the ~250ms it missed
-                    f = pipe.feed(c, tag)
-                    if f:
-                        emit(f)
+                    try:
+                        f = pipe.feed(c, tag)
+                        if f:
+                            emit(f)
+                    except Exception as e:
+                        rep.set(f"asr-{tag}", "err",
+                                f"decode err: {e}")
+                        break
             hang = 1.5
         elif hang > 0:
             hang -= len(chunk) / SR
@@ -2059,9 +2097,10 @@ def main():
     try:                                     # decode can't serialize
         def pump():
             if splash:
-                if _dl["mb"]:
-                    splash._lbl.config(
-                        text=f"downloading model — {_dl['mb']} MB")
+                splash._lbl.config(text=(
+                    "livecap — loading models…"
+                    if _dl.get("done") or not _dl["mb"]
+                    else f"downloading model — {_dl['mb']} MB"))
                 splash.update()
             else:
                 time.sleep(0.05)
@@ -2076,7 +2115,7 @@ def main():
     # queues first — the cable's finished_callback reports to gui_q
     mic_q = queue.Queue(maxsize=10)      # voice path: <160ms, drop not delay
     micasr_q = queue.Queue(maxsize=64)   # ~1s of 16ms chunks
-    qs = queue.Queue(maxsize=64)         # ~2s of 32ms chunks
+    qs = queue.Queue(maxsize=20)         # ~2s of 100ms chunks
     gui_q = queue.Queue(maxsize=1024)     # bounded — a stalled overlay
                                           # can't eat RAM
     rep = Reporter(gui_q)                  # ONE dedupe memory shared
@@ -2090,6 +2129,8 @@ def main():
              "ev": threading.Event(), "cands": []}
     cands = cable_candidates()
     state["cands"] = cands
+    state["sig"] = dev_sig()           # reinit only fires when the
+                                       # device set actually changes
     if not cands:
         state["cable_absent"] = True
         status.append(("cable","warn","no VB-CABLE"))
@@ -2141,36 +2182,34 @@ def main():
     trans_q = queue.Queue(maxsize=16) if args.lang else None
 
     in_stream, mic_sr = None, SR
-    if out_stream is None:
-        status.append(("mic","warn","mic off"))
+    # you: captions need only the mic — passthrough needs the cable
+    mic_idx = pick_mic()
+    if mic_idx is None:
+        status.append(("mic","warn","no mic"))
+        mark_dead(state, "mic", rep, "no mic")
     else:
-        mic_idx = pick_mic()
-        if mic_idx is None:
-            status.append(("mic","warn","no mic"))
-            mark_dead(state, "mic", rep, "no mic")
-        else:
-         try:
-            st, mic_sr = open_mic(
-                mic_idx, den, mic_q, gui_q,
-                dead=dead_cb(state, "mic", rep,
-                             "mic stream stopped"))
-            try:
-                st.start()
+     try:
+        st, mic_sr = open_mic(
+            mic_idx, den, mic_q, gui_q,
+            dead=dead_cb(state, "mic", rep,
+                         "mic stream stopped"))
+        try:
+            st.start()
+        except Exception:
+            try:                     # a failed start leaks the
+                st.close()           # stream handle — close it
             except Exception:
-                try:                     # a failed start leaks the
-                    st.close()           # stream handle — close it
-                except Exception:
-                    pass
-                raise
-            in_stream = st                 # assign only after start()
-            state["in"], state["mic_sr"] = st, mic_sr
-            status.append(("mic","ok","mic ✓"))
-            diag(f"mic open: dev{mic_idx} {mic_sr}Hz "
-                 f"latency={st.latency}")
-         except Exception as e:
-            status.append(("mic","warn","no mic"))
-            diag(f"no mic input ({e})")
-            mark_dead(state, "mic", rep, "mic open failed")
+                pass
+            raise
+        in_stream = st                 # assign only after start()
+        state["in"], state["mic_sr"] = st, mic_sr
+        status.append(("mic","ok","mic ✓"))
+        diag(f"mic open: dev{mic_idx} {mic_sr}Hz "
+             f"latency={st.latency}")
+     except Exception as e:
+        status.append(("mic","warn","no mic"))
+        diag(f"no mic input ({e})")
+        mark_dead(state, "mic", rep, "mic open failed")
     if out_stream is not None:
         try:
             out_stream.start()
@@ -2249,8 +2288,11 @@ def main():
                     hk_tid[0], 0x0012, 0, 0)   # WM_QUIT — it unregisters
         except Exception:                # + joins; daemon dies anyway
             pass
-        for w in workers:                # let workers flush + emit
-            w.join(timeout=3)
+        end = time.time() + 4            # shared deadline — worst
+        for w in workers:                # case is one hung worker,
+            w.join(timeout=max(0.05, end - time.time()))  # not N*3s
+            if w.is_alive():
+                diag(f"shutdown: {w.name} still blocked")
             if w.is_alive():
                 diag(f"shutdown: {w.name} still blocked after 3s")
         try:

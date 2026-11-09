@@ -286,6 +286,35 @@ class ReinitClosesAllTest(unittest.TestCase):
         self.assertTrue(state["cable_dead"])
         self.assertEqual(state["cands"], [0])
 
+    def test_unchanged_sig_skips_reinit(self):
+        state = {"in": None, "out": None, "ring": None,
+                 "reinit_t": -999.0, "ev": threading.Event(),
+                 "sig": frozenset({"a", "b"})}
+        rep = livecap.Reporter(queue.Queue())
+        with mock.patch.object(livecap, "dev_sig",
+                               return_value=frozenset({"a", "b"})):
+            self.assertFalse(livecap._sd_reinit(state, rep))
+
+    def test_changed_sig_reinits(self):
+        class St:
+            def stop(self):
+                pass
+            def close(self):
+                pass
+        state = {"in": St(), "out": None, "ring": object(),
+                 "mic_dead": False, "cable_dead": True,
+                 "reinit_t": -999.0, "ev": threading.Event(),
+                 "sig": frozenset({"a"})}
+        rep = livecap.Reporter(queue.Queue())
+        with mock.patch.object(livecap, "dev_sig",
+                               return_value=frozenset({"a", "b"})), \
+                mock.patch.object(livecap.sd, "_terminate"), \
+                mock.patch.object(livecap.sd, "_initialize"), \
+                mock.patch.object(livecap, "cable_candidates",
+                                  return_value=[]):
+            self.assertTrue(livecap._sd_reinit(state, rep))
+        self.assertEqual(state["sig"], frozenset({"a", "b"}))
+
 
 class Sha256FileTest(unittest.TestCase):
 
